@@ -20,9 +20,7 @@ Gmail                   Qwen3-14B (summarize/ask-about only)
 
 ## Installation
 
-```bash
-uv pip install -r requirements.txt
-```
+No separate install step needed. The `uv run` command automatically manages dependencies.
 
 ### Requirements
 
@@ -202,7 +200,7 @@ Environment variables:
 Run tests:
 
 ```bash
-uv run pytest tests/ -v
+uv run --extra dev pytest tests/ -v
 ```
 
 The test suite uses mocked Gmail API and LLM responses - no credentials required.

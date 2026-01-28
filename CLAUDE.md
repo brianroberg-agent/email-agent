@@ -8,24 +8,22 @@ This is an email agent server - a privacy-focused FastAPI wrapper around the Gma
 
 ## Package Management
 
-Use `uv` for package management:
+Use `uv` for package management. Dependencies are defined in `pyproject.toml`.
 
 ```bash
-# Install dependencies
-uv pip install -r requirements.txt
-
-# Add a new dependency
-uv pip install <package>
-
-# Run commands in the virtual environment
-uv run pytest tests/ -v
+# Run the server (uv handles dependencies automatically)
 uv run uvicorn email_server:app --port 8081
+
+# Run tests (includes dev dependencies)
+uv run --extra dev pytest tests/ -v
+
+# Add a new dependency: edit pyproject.toml, then uv will install it on next run
 ```
 
 ## Running Tests
 
 ```bash
-uv run pytest tests/ -v
+uv run --extra dev pytest tests/ -v
 ```
 
 The test suite uses mocked Gmail API and LLM responses - no credentials required.
@@ -38,7 +36,7 @@ The test suite uses mocked Gmail API and LLM responses - no credentials required
   - `conftest.py` - Shared fixtures and sample data
   - `test_email_server.py` - Endpoint and utility tests
   - `test_readme_documentation.py` - Verifies all endpoints are documented in README
-- `requirements.txt` - Python dependencies
+- `pyproject.toml` - Project metadata and dependencies
 
 ## Key Design Decisions
 
