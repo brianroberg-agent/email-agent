@@ -172,10 +172,12 @@ class TestSearchEndpoint:
         assert msg["id"] == "msg123"
         assert msg["date"] == "Jan 25, 2026 3:42 PM"
         assert msg["from_addr"] == "Sender Name <sender@example.com>"
+        assert msg["from_name"] == "Sender Name"
         assert msg["subject"] == "Re: Important Topic"
         assert msg["snippet"] == "Thanks for reaching out. I wanted to let you know that..."
         assert "INBOX" in msg["labels"]
         assert "UNREAD" in msg["labels"]
+        assert msg["has_attachments"] is False
 
     @patch("email_server.get_gmail_service")
     @pytest.mark.parametrize("error_message", [
@@ -712,3 +714,460 @@ class TestRequestValidation:
     def test_archive_requires_email_id(self, client):
         response = client.post("/archive", json={})
         assert response.status_code == 422
+
+
+class TestBatchSummarizeEndpoint:
+    """Tests for the /batch-summarize endpoint."""
+
+    @patch("email_server.call_local_llm", new_callable=AsyncMock)
+    @patch("email_server.get_gmail_service")
+    def test_batch_summarize_basic(self, mock_get_service, mock_llm, client):
+        mock_service = Mock()
+        mock_get_service.return_value = mock_service
+        mock_service.users.return_value.messages.return_value.get.return_value.execute.return_value = SAMPLE_MESSAGES["with_body"]
+
+        mock_llm.return_value = '{"summary": "Test summary", "detected_action": "info_only", "detected_deadline": null}'
+
+        response = client.post("/batch-summarize", json={"message_ids": ["msg123", "msg456"]})
+        assert response.status_code == 200
+
+        data = response.json()
+        assert data["success"] is True
+        assert len(data["results"]) == 2
+        assert data["results"][0]["success"] is True
+        assert data["results"][0]["summary"] == "Test summary"
+        assert data["results"][0]["detected_action"] == "info_only"
+
+    @patch("email_server.call_local_llm", new_callable=AsyncMock)
+    @patch("email_server.get_gmail_service")
+    def test_batch_summarize_parses_json_response(self, mock_get_service, mock_llm, client):
+        mock_service = Mock()
+        mock_get_service.return_value = mock_service
+        mock_service.users.return_value.messages.return_value.get.return_value.execute.return_value = SAMPLE_MESSAGES["with_body"]
+
+        mock_llm.return_value = '{"summary": "Review this PR", "detected_action": "review_requested", "detected_deadline": "2026-02-01"}'
+
+        response = client.post("/batch-summarize", json={"message_ids": ["msg123"]})
+        data = response.json()
+
+        result = data["results"][0]
+        assert result["summary"] == "Review this PR"
+        assert result["detected_action"] == "review_requested"
+        assert result["detected_deadline"] == "2026-02-01"
+
+    @patch("email_server.call_local_llm", new_callable=AsyncMock)
+    @patch("email_server.get_gmail_service")
+    def test_batch_summarize_handles_invalid_json(self, mock_get_service, mock_llm, client):
+        mock_service = Mock()
+        mock_get_service.return_value = mock_service
+        mock_service.users.return_value.messages.return_value.get.return_value.execute.return_value = SAMPLE_MESSAGES["with_body"]
+
+        # Non-JSON response should fall back to raw summary
+        mock_llm.return_value = "This is a plain text summary without JSON."
+
+        response = client.post("/batch-summarize", json={"message_ids": ["msg123"]})
+        data = response.json()
+
+        result = data["results"][0]
+        assert result["success"] is True
+        assert result["summary"] == "This is a plain text summary without JSON."
+        assert result["detected_action"] is None
+
+    @patch("email_server.call_local_llm", new_callable=AsyncMock)
+    @patch("email_server.get_gmail_service")
+    def test_batch_summarize_handles_invalid_action_type(self, mock_get_service, mock_llm, client):
+        mock_service = Mock()
+        mock_get_service.return_value = mock_service
+        mock_service.users.return_value.messages.return_value.get.return_value.execute.return_value = SAMPLE_MESSAGES["with_body"]
+
+        # Invalid action type should be ignored
+        mock_llm.return_value = '{"summary": "Test", "detected_action": "unknown_action", "detected_deadline": null}'
+
+        response = client.post("/batch-summarize", json={"message_ids": ["msg123"]})
+        data = response.json()
+
+        result = data["results"][0]
+        assert result["success"] is True
+        assert result["detected_action"] is None
+
+    @patch("email_server.call_local_llm", new_callable=AsyncMock)
+    @patch("email_server.get_gmail_service")
+    def test_batch_summarize_continues_on_individual_error(self, mock_get_service, mock_llm, client):
+        mock_service = Mock()
+        mock_get_service.return_value = mock_service
+
+        # First message succeeds, second fails
+        def get_side_effect(userId, id, format):
+            mock_result = Mock()
+            if id == "msg_fail":
+                mock_result.execute.side_effect = Exception("Message not found")
+            else:
+                mock_result.execute.return_value = SAMPLE_MESSAGES["with_body"]
+            return mock_result
+
+        mock_service.users.return_value.messages.return_value.get.side_effect = get_side_effect
+        mock_llm.return_value = '{"summary": "Success", "detected_action": null, "detected_deadline": null}'
+
+        response = client.post("/batch-summarize", json={"message_ids": ["msg_ok", "msg_fail"]})
+        data = response.json()
+
+        assert data["success"] is True
+        assert len(data["results"]) == 2
+        assert data["results"][0]["success"] is True
+        assert data["results"][1]["success"] is False
+        assert "not found" in data["results"][1]["error"]
+
+    @patch("email_server.get_gmail_service")
+    def test_batch_summarize_handles_service_error(self, mock_get_service, client):
+        mock_get_service.side_effect = Exception("Gmail service unavailable")
+
+        response = client.post("/batch-summarize", json={"message_ids": ["msg123"]})
+        data = response.json()
+
+        assert data["success"] is False
+        assert "Gmail service unavailable" in data["error"]
+
+    def test_batch_summarize_requires_message_ids(self, client):
+        response = client.post("/batch-summarize", json={})
+        assert response.status_code == 422
+
+    @patch("email_server.call_local_llm", new_callable=AsyncMock)
+    @patch("email_server.get_gmail_service")
+    @pytest.mark.parametrize("action_type", [
+        "review_requested",
+        "meeting_request",
+        "info_only",
+        "action_required",
+        "approval_needed",
+        "question",
+        "follow_up",
+        "deadline",
+    ])
+    def test_batch_summarize_all_action_types(self, mock_get_service, mock_llm, client, action_type):
+        mock_service = Mock()
+        mock_get_service.return_value = mock_service
+        mock_service.users.return_value.messages.return_value.get.return_value.execute.return_value = SAMPLE_MESSAGES["with_body"]
+
+        mock_llm.return_value = f'{{"summary": "Test", "detected_action": "{action_type}", "detected_deadline": null}}'
+
+        response = client.post("/batch-summarize", json={"message_ids": ["msg123"]})
+        data = response.json()
+
+        assert data["results"][0]["detected_action"] == action_type
+
+
+class TestBulkActionsEndpoint:
+    """Tests for the /bulk-actions endpoint."""
+
+    @patch("email_server.get_gmail_service_with_modify")
+    def test_bulk_actions_mark_read(self, mock_get_service, client):
+        mock_service = Mock()
+        mock_get_service.return_value = mock_service
+
+        response = client.post("/bulk-actions", json={
+            "email_ids": ["msg123", "msg456"],
+            "operations": ["mark_read"]
+        })
+        assert response.status_code == 200
+
+        data = response.json()
+        assert data["success"] is True
+        assert data["success_count"] == 2
+        assert data["error_count"] == 0
+        assert len(data["results"]) == 2
+        assert all(r["success"] for r in data["results"])
+
+    @patch("email_server.get_gmail_service_with_modify")
+    def test_bulk_actions_archive(self, mock_get_service, client):
+        mock_service = Mock()
+        mock_get_service.return_value = mock_service
+
+        response = client.post("/bulk-actions", json={
+            "email_ids": ["msg123"],
+            "operations": ["archive"]
+        })
+        data = response.json()
+
+        assert data["success"] is True
+        call_kwargs = mock_service.users.return_value.messages.return_value.modify.call_args[1]
+        assert call_kwargs["body"] == {"removeLabelIds": ["INBOX"]}
+
+    @patch("email_server.get_gmail_service_with_modify")
+    def test_bulk_actions_apply_label(self, mock_get_service, client):
+        mock_service = Mock()
+        mock_get_service.return_value = mock_service
+
+        response = client.post("/bulk-actions", json={
+            "email_ids": ["msg123"],
+            "operations": ["apply_label:IMPORTANT"]
+        })
+        data = response.json()
+
+        assert data["success"] is True
+        call_kwargs = mock_service.users.return_value.messages.return_value.modify.call_args[1]
+        assert call_kwargs["body"] == {"addLabelIds": ["IMPORTANT"]}
+
+    @patch("email_server.get_gmail_service_with_modify")
+    def test_bulk_actions_multiple_operations(self, mock_get_service, client):
+        mock_service = Mock()
+        mock_get_service.return_value = mock_service
+
+        response = client.post("/bulk-actions", json={
+            "email_ids": ["msg123"],
+            "operations": ["mark_read", "archive", "apply_label:PROCESSED"]
+        })
+        data = response.json()
+
+        assert data["success"] is True
+        assert data["success_count"] == 1
+        # Should have been called 3 times (once per operation)
+        assert mock_service.users.return_value.messages.return_value.modify.call_count == 3
+
+    @patch("email_server.get_gmail_service_with_modify")
+    def test_bulk_actions_partial_failure(self, mock_get_service, client):
+        mock_service = Mock()
+        mock_get_service.return_value = mock_service
+
+        # First email succeeds, second fails
+        call_count = [0]
+        def modify_side_effect(userId, id, body):
+            call_count[0] += 1
+            mock_result = Mock()
+            if id == "msg_fail":
+                mock_result.execute.side_effect = Exception("Permission denied")
+            else:
+                mock_result.execute.return_value = {}
+            return mock_result
+
+        mock_service.users.return_value.messages.return_value.modify.side_effect = modify_side_effect
+
+        response = client.post("/bulk-actions", json={
+            "email_ids": ["msg_ok", "msg_fail"],
+            "operations": ["mark_read"]
+        })
+        data = response.json()
+
+        assert data["success"] is True  # Overall request succeeded
+        assert data["success_count"] == 1
+        assert data["error_count"] == 1
+        assert data["results"][0]["success"] is True
+        assert data["results"][1]["success"] is False
+        assert "Permission denied" in data["results"][1]["error"]
+
+    @patch("email_server.get_gmail_service_with_modify")
+    def test_bulk_actions_unknown_operation(self, mock_get_service, client):
+        mock_service = Mock()
+        mock_get_service.return_value = mock_service
+
+        response = client.post("/bulk-actions", json={
+            "email_ids": ["msg123"],
+            "operations": ["unknown_op"]
+        })
+        data = response.json()
+
+        assert data["success"] is True
+        assert data["error_count"] == 1
+        assert "Unknown operation" in data["results"][0]["error"]
+
+    @patch("email_server.get_gmail_service_with_modify")
+    def test_bulk_actions_handles_service_error(self, mock_get_service, client):
+        mock_get_service.side_effect = Exception("Gmail service unavailable")
+
+        response = client.post("/bulk-actions", json={
+            "email_ids": ["msg123"],
+            "operations": ["mark_read"]
+        })
+        data = response.json()
+
+        assert data["success"] is False
+        assert "Gmail service unavailable" in data["error"]
+
+    def test_bulk_actions_requires_email_ids(self, client):
+        response = client.post("/bulk-actions", json={"operations": ["mark_read"]})
+        assert response.status_code == 422
+
+    def test_bulk_actions_requires_operations(self, client):
+        response = client.post("/bulk-actions", json={"email_ids": ["msg123"]})
+        assert response.status_code == 422
+
+    @patch("email_server.get_gmail_service_with_modify")
+    def test_bulk_actions_empty_lists(self, mock_get_service, client):
+        mock_service = Mock()
+        mock_get_service.return_value = mock_service
+
+        response = client.post("/bulk-actions", json={
+            "email_ids": [],
+            "operations": ["mark_read"]
+        })
+        data = response.json()
+
+        assert data["success"] is True
+        assert data["success_count"] == 0
+        assert data["error_count"] == 0
+        assert data["results"] == []
+
+
+class TestSearchEndpointNewFields:
+    """Tests for the new from_name and has_attachments fields in /search."""
+
+    @patch("email_server.get_gmail_service")
+    def test_search_returns_from_name(self, mock_get_service, client):
+        mock_service = Mock()
+        mock_get_service.return_value = mock_service
+
+        mock_messages = mock_service.users.return_value.messages
+        mock_messages.return_value.list.return_value.execute.return_value = {
+            "messages": [{"id": "msg123", "threadId": "thread123"}]
+        }
+        mock_messages.return_value.get.return_value.execute.return_value = SAMPLE_MESSAGES["basic"]
+
+        response = client.post("/search", json={"limit": 1})
+        data = response.json()
+
+        msg = data["messages"][0]
+        assert msg["from_name"] == "Sender Name"
+        assert msg["from_addr"] == "Sender Name <sender@example.com>"
+
+    @patch("email_server.get_gmail_service")
+    def test_search_returns_from_name_email_only(self, mock_get_service, client):
+        mock_service = Mock()
+        mock_get_service.return_value = mock_service
+
+        # Message with email-only From header
+        msg_data = {
+            "id": "msg123",
+            "labelIds": ["INBOX"],
+            "snippet": "Test",
+            "payload": {
+                "headers": [
+                    {"name": "From", "value": "noreply@example.com"},
+                    {"name": "Subject", "value": "Test"},
+                    {"name": "Date", "value": "Jan 28, 2026"},
+                ]
+            }
+        }
+
+        mock_messages = mock_service.users.return_value.messages
+        mock_messages.return_value.list.return_value.execute.return_value = {
+            "messages": [{"id": "msg123"}]
+        }
+        mock_messages.return_value.get.return_value.execute.return_value = msg_data
+
+        response = client.post("/search", json={"limit": 1})
+        data = response.json()
+
+        msg = data["messages"][0]
+        assert msg["from_name"] == "noreply@example.com"
+
+    @patch("email_server.get_gmail_service")
+    def test_search_detects_attachments(self, mock_get_service, client):
+        mock_service = Mock()
+        mock_get_service.return_value = mock_service
+
+        mock_messages = mock_service.users.return_value.messages
+        mock_messages.return_value.list.return_value.execute.return_value = {
+            "messages": [{"id": "msg_attach"}]
+        }
+        mock_messages.return_value.get.return_value.execute.return_value = SAMPLE_MESSAGES["with_attachment"]
+
+        response = client.post("/search", json={"limit": 1})
+        data = response.json()
+
+        msg = data["messages"][0]
+        assert msg["has_attachments"] is True
+
+    @patch("email_server.get_gmail_service")
+    def test_search_no_attachments(self, mock_get_service, client):
+        mock_service = Mock()
+        mock_get_service.return_value = mock_service
+
+        mock_messages = mock_service.users.return_value.messages
+        mock_messages.return_value.list.return_value.execute.return_value = {
+            "messages": [{"id": "msg_no_attach"}]
+        }
+        mock_messages.return_value.get.return_value.execute.return_value = SAMPLE_MESSAGES["without_attachment"]
+
+        response = client.post("/search", json={"limit": 1})
+        data = response.json()
+
+        msg = data["messages"][0]
+        assert msg["has_attachments"] is False
+
+
+class TestHelperFunctions:
+    """Tests for helper functions."""
+
+    def test_parse_sender_name_with_name(self):
+        from email_server import parse_sender_name
+        assert parse_sender_name("John Doe <john@example.com>") == "John Doe"
+
+    def test_parse_sender_name_email_only(self):
+        from email_server import parse_sender_name
+        assert parse_sender_name("john@example.com") == "john@example.com"
+
+    def test_parse_sender_name_empty(self):
+        from email_server import parse_sender_name
+        assert parse_sender_name("") == ""
+
+    def test_parse_sender_name_quoted_name(self):
+        from email_server import parse_sender_name
+        assert parse_sender_name('"Doe, John" <john@example.com>') == '"Doe, John"'
+
+    def test_has_attachments_with_attachment(self):
+        from email_server import has_attachments
+        payload = {
+            "parts": [
+                {"mimeType": "text/plain", "body": {"data": "test"}},
+                {"mimeType": "application/pdf", "filename": "doc.pdf", "body": {"attachmentId": "123"}}
+            ]
+        }
+        assert has_attachments(payload) is True
+
+    def test_has_attachments_without_attachment(self):
+        from email_server import has_attachments
+        payload = {
+            "parts": [
+                {"mimeType": "text/plain", "body": {"data": "test"}},
+                {"mimeType": "text/html", "body": {"data": "<html></html>"}}
+            ]
+        }
+        assert has_attachments(payload) is False
+
+    def test_has_attachments_empty_payload(self):
+        from email_server import has_attachments
+        assert has_attachments({}) is False
+        assert has_attachments(None) is False
+
+    def test_has_attachments_inline_image_not_counted(self):
+        from email_server import has_attachments
+        payload = {
+            "parts": [
+                {
+                    "mimeType": "image/png",
+                    "filename": "image.png",
+                    "headers": [{"name": "Content-Disposition", "value": "inline"}],
+                    "body": {"attachmentId": "123"}
+                }
+            ]
+        }
+        assert has_attachments(payload) is False
+
+    def test_has_attachments_nested_parts(self):
+        from email_server import has_attachments
+        payload = {
+            "parts": [
+                {
+                    "mimeType": "multipart/alternative",
+                    "parts": [
+                        {"mimeType": "text/plain", "body": {"data": "test"}},
+                        {
+                            "mimeType": "multipart/related",
+                            "parts": [
+                                {"mimeType": "application/pdf", "filename": "nested.pdf", "body": {"attachmentId": "123"}}
+                            ]
+                        }
+                    ]
+                }
+            ]
+        }
+        assert has_attachments(payload) is True

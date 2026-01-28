@@ -85,9 +85,11 @@ Response:
       "id": "18d5a3b2c4e5f6a7",
       "date": "Jan 25, 2026 3:42 PM",
       "from_addr": "Sender Name <sender@example.com>",
+      "from_name": "Sender Name",
       "subject": "Re: Topic",
       "snippet": "Thanks for reaching out...",
-      "labels": ["INBOX", "UNREAD"]
+      "labels": ["INBOX", "UNREAD"],
+      "has_attachments": false
     }
   ],
   "error": null
@@ -175,6 +177,89 @@ curl -X POST http://localhost:8081/archive \
 Response:
 ```json
 {"success": true, "message": "Email archived"}
+```
+
+### POST /batch-summarize
+
+Summarize multiple emails with triage information. Processes emails sequentially and returns structured data including detected action types and deadlines.
+
+```bash
+curl -X POST http://localhost:8081/batch-summarize \
+  -H "Content-Type: application/json" \
+  -d '{"message_ids": ["18d5a3b2c4e5f6a7", "18d5a3b2c4e5f6a8"]}'
+```
+
+Response:
+```json
+{
+  "success": true,
+  "results": [
+    {
+      "message_id": "18d5a3b2c4e5f6a7",
+      "success": true,
+      "summary": "John is requesting a review of the Q4 report by Friday.",
+      "detected_action": "review_requested",
+      "detected_deadline": "2026-02-01",
+      "error": null
+    },
+    {
+      "message_id": "18d5a3b2c4e5f6a8",
+      "success": true,
+      "summary": "Weekly newsletter with company updates.",
+      "detected_action": "info_only",
+      "detected_deadline": null,
+      "error": null
+    }
+  ],
+  "error": null
+}
+```
+
+Detected action types:
+| Action | Description |
+|--------|-------------|
+| `review_requested` | Someone is asking you to review something |
+| `meeting_request` | Calendar invite or meeting scheduling |
+| `info_only` | FYI, newsletter, or informational update |
+| `action_required` | Explicit request for you to do something |
+| `approval_needed` | Waiting for your approval or sign-off |
+| `question` | Someone is asking you a question |
+| `follow_up` | Following up on a previous conversation |
+| `deadline` | Contains a deadline or time-sensitive request |
+
+### POST /bulk-actions
+
+Apply multiple operations to multiple emails. Always returns 200 with per-email results for easy client handling.
+
+```bash
+curl -X POST http://localhost:8081/bulk-actions \
+  -H "Content-Type: application/json" \
+  -d '{"email_ids": ["18d5a3b2c4e5f6a7", "18d5a3b2c4e5f6a8"], "operations": ["mark_read", "apply_label:PROCESSED"]}'
+```
+
+Request body:
+| Field | Type | Description |
+|-------|------|-------------|
+| `email_ids` | string[] | List of email IDs to act on |
+| `operations` | string[] | Operations to apply (see below) |
+
+Supported operations:
+- `mark_read` - Remove UNREAD label
+- `archive` - Remove INBOX label
+- `apply_label:LABEL_NAME` - Add the specified label (e.g., `apply_label:IMPORTANT`)
+
+Response:
+```json
+{
+  "success": true,
+  "results": [
+    {"email_id": "18d5a3b2c4e5f6a7", "success": true, "error": null},
+    {"email_id": "18d5a3b2c4e5f6a8", "success": true, "error": null}
+  ],
+  "success_count": 2,
+  "error_count": 0,
+  "error": null
+}
 ```
 
 ## Configuration
