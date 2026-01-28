@@ -19,7 +19,7 @@ Claude Code (cloud, orchestrator)
     │
     │  structured HTTP endpoints (JSON)
     ▼
-email_server_v2.py (local FastAPI server, port 8081)
+email_server.py (local FastAPI server, port 8081)
     │                        │
     │ Gmail API (OAuth)      │ Local LLM (MLX, port 8080)
     ▼                        ▼
@@ -33,7 +33,7 @@ Gmail                   Qwen3-14B (summarize/ask-about only)
 All code writing happens here. Mock the Gmail API and LLM for testing.
 
 **Deliverables:**
-- `email_server_v2.py` — the full server implementation
+- `email_server.py` — the full server implementation
 - `gmail_utils.py` — Gmail utility functions (auth, header extraction, body decoding)
 - `requirements.txt`
 - Unit tests with mocked Gmail API responses and mocked LLM responses
@@ -50,7 +50,7 @@ Integration testing and deployment. No new code writing — just plug in real se
 **Steps:**
 1. Copy `token.json` (Gmail OAuth credentials) into the project directory
 2. Copy `setup_oauth.py` (OAuth setup script, in case re-auth is needed)
-3. Start the server: `uvicorn email_server_v2:app --port 8081`
+3. Start the server: `uvicorn email_server:app --port 8081`
 4. Test `/search` and write endpoints against real Gmail
 5. Start MLX server on port 8080, test `/summarize` and `/ask-about` with real emails
 6. Install updated skill files in `~/.claude/skills/`
@@ -320,7 +320,7 @@ No `agent-framework`, no `openai` package. Much simpler dependency tree.
 
 ```bash
 cd <project-directory>  # must contain token.json
-uvicorn email_server_v2:app --host 0.0.0.0 --port 8081
+uvicorn email_server:app --host 0.0.0.0 --port 8081
 ```
 
 The server must be started from the directory containing `token.json` (Gmail OAuth credentials), since `get_gmail_service()` uses a relative path to load it.

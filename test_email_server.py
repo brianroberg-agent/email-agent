@@ -1,10 +1,10 @@
-"""Unit tests for email_server_v2 with mocked Gmail API and LLM."""
+"""Unit tests for email_server with mocked Gmail API and LLM."""
 
 import pytest
 from unittest.mock import Mock, patch, AsyncMock
 from fastapi.testclient import TestClient
 
-from email_server_v2 import app
+from email_server import app
 
 
 @pytest.fixture
@@ -62,7 +62,7 @@ class TestHealthEndpoint:
 
 
 class TestSearchEndpoint:
-    @patch("email_server_v2.get_gmail_service")
+    @patch("email_server.get_gmail_service")
     def test_search_basic(self, mock_get_service, client):
         # Setup mock
         mock_service = Mock()
@@ -81,7 +81,7 @@ class TestSearchEndpoint:
         assert data["error"] is None
         assert len(data["messages"]) == 2
 
-    @patch("email_server_v2.get_gmail_service")
+    @patch("email_server.get_gmail_service")
     def test_search_with_filters(self, mock_get_service, client):
         mock_service = Mock()
         mock_get_service.return_value = mock_service
@@ -107,7 +107,7 @@ class TestSearchEndpoint:
         assert call_args[1]["labelIds"] == ["INBOX"]
         assert call_args[1]["maxResults"] == 5
 
-    @patch("email_server_v2.get_gmail_service")
+    @patch("email_server.get_gmail_service")
     def test_search_with_date_filters(self, mock_get_service, client):
         mock_service = Mock()
         mock_get_service.return_value = mock_service
@@ -126,7 +126,7 @@ class TestSearchEndpoint:
         assert "after:2026/01/20" in call_args[1]["q"]
         assert "before:2026/01/27" in call_args[1]["q"]
 
-    @patch("email_server_v2.get_gmail_service")
+    @patch("email_server.get_gmail_service")
     def test_search_returns_correct_structure(self, mock_get_service, client):
         mock_service = Mock()
         mock_get_service.return_value = mock_service
@@ -150,7 +150,7 @@ class TestSearchEndpoint:
         assert "INBOX" in msg["labels"]
         assert "UNREAD" in msg["labels"]
 
-    @patch("email_server_v2.get_gmail_service")
+    @patch("email_server.get_gmail_service")
     def test_search_handles_error(self, mock_get_service, client):
         mock_get_service.side_effect = Exception("Gmail API error")
 
@@ -164,8 +164,8 @@ class TestSearchEndpoint:
 
 
 class TestSummarizeEndpoint:
-    @patch("email_server_v2.call_local_llm", new_callable=AsyncMock)
-    @patch("email_server_v2.get_gmail_service")
+    @patch("email_server.call_local_llm", new_callable=AsyncMock)
+    @patch("email_server.get_gmail_service")
     def test_summarize_basic(self, mock_get_service, mock_llm, client):
         mock_service = Mock()
         mock_get_service.return_value = mock_service
@@ -181,8 +181,8 @@ class TestSummarizeEndpoint:
         assert data["answer"] == "The sender is thanking you for the conversation."
         assert data["error"] is None
 
-    @patch("email_server_v2.call_local_llm", new_callable=AsyncMock)
-    @patch("email_server_v2.get_gmail_service")
+    @patch("email_server.call_local_llm", new_callable=AsyncMock)
+    @patch("email_server.get_gmail_service")
     def test_summarize_uses_correct_system_prompt(self, mock_get_service, mock_llm, client):
         mock_service = Mock()
         mock_get_service.return_value = mock_service
@@ -198,7 +198,7 @@ class TestSummarizeEndpoint:
         assert "summarizing an email" in system_prompt
         assert "untrusted data" in system_prompt
 
-    @patch("email_server_v2.get_gmail_service")
+    @patch("email_server.get_gmail_service")
     def test_summarize_handles_gmail_error(self, mock_get_service, client):
         mock_get_service.side_effect = Exception("Gmail API error")
 
@@ -211,8 +211,8 @@ class TestSummarizeEndpoint:
 
 
 class TestAskAboutEndpoint:
-    @patch("email_server_v2.call_local_llm", new_callable=AsyncMock)
-    @patch("email_server_v2.get_gmail_service")
+    @patch("email_server.call_local_llm", new_callable=AsyncMock)
+    @patch("email_server.get_gmail_service")
     def test_ask_about_basic(self, mock_get_service, mock_llm, client):
         mock_service = Mock()
         mock_get_service.return_value = mock_service
@@ -231,8 +231,8 @@ class TestAskAboutEndpoint:
         assert "dollar amount" in data["answer"]
         assert data["error"] is None
 
-    @patch("email_server_v2.call_local_llm", new_callable=AsyncMock)
-    @patch("email_server_v2.get_gmail_service")
+    @patch("email_server.call_local_llm", new_callable=AsyncMock)
+    @patch("email_server.get_gmail_service")
     def test_ask_about_includes_question_in_prompt(self, mock_get_service, mock_llm, client):
         mock_service = Mock()
         mock_get_service.return_value = mock_service
@@ -252,7 +252,7 @@ class TestAskAboutEndpoint:
 
 
 class TestMarkReadEndpoint:
-    @patch("email_server_v2.get_gmail_service_with_modify")
+    @patch("email_server.get_gmail_service_with_modify")
     def test_mark_read_success(self, mock_get_service, client):
         mock_service = Mock()
         mock_get_service.return_value = mock_service
@@ -270,7 +270,7 @@ class TestMarkReadEndpoint:
         assert call_kwargs["id"] == "msg123"
         assert call_kwargs["body"] == {"removeLabelIds": ["UNREAD"]}
 
-    @patch("email_server_v2.get_gmail_service_with_modify")
+    @patch("email_server.get_gmail_service_with_modify")
     def test_mark_read_handles_error(self, mock_get_service, client):
         mock_get_service.side_effect = Exception("Gmail API error")
 
@@ -279,7 +279,7 @@ class TestMarkReadEndpoint:
 
 
 class TestApplyLabelEndpoint:
-    @patch("email_server_v2.get_gmail_service_with_modify")
+    @patch("email_server.get_gmail_service_with_modify")
     def test_apply_label_success(self, mock_get_service, client):
         mock_service = Mock()
         mock_get_service.return_value = mock_service
@@ -300,7 +300,7 @@ class TestApplyLabelEndpoint:
 
 
 class TestArchiveEndpoint:
-    @patch("email_server_v2.get_gmail_service_with_modify")
+    @patch("email_server.get_gmail_service_with_modify")
     def test_archive_success(self, mock_get_service, client):
         mock_service = Mock()
         mock_get_service.return_value = mock_service
@@ -368,17 +368,17 @@ class TestGmailUtils:
 
 class TestBuildGmailQuery:
     def test_build_query_empty(self):
-        from email_server_v2 import build_gmail_query, SearchRequest
+        from email_server import build_gmail_query, SearchRequest
         request = SearchRequest()
         assert build_gmail_query(request) == ""
 
     def test_build_query_single_filter(self):
-        from email_server_v2 import build_gmail_query, SearchRequest
+        from email_server import build_gmail_query, SearchRequest
         request = SearchRequest(from_addr="test@example.com")
         assert build_gmail_query(request) == "from:test@example.com"
 
     def test_build_query_multiple_filters(self):
-        from email_server_v2 import build_gmail_query, SearchRequest
+        from email_server import build_gmail_query, SearchRequest
         request = SearchRequest(
             from_addr="sender@example.com",
             subject="meeting",
@@ -390,7 +390,7 @@ class TestBuildGmailQuery:
         assert "after:2026/01/20" in query
 
     def test_build_query_with_raw_query(self):
-        from email_server_v2 import build_gmail_query, SearchRequest
+        from email_server import build_gmail_query, SearchRequest
         request = SearchRequest(
             from_addr="sender@example.com",
             query="is:unread"
