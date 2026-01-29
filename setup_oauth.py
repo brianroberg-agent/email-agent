@@ -24,7 +24,7 @@ from google_auth_oauthlib.flow import InstalledAppFlow
 # Scopes needed by this email agent server
 SCOPES = [
     "https://www.googleapis.com/auth/gmail.readonly",  # List, read emails
-    "https://www.googleapis.com/auth/gmail.labels",    # Apply labels
+    "https://www.googleapis.com/auth/gmail.modify",    # Mark read, label, archive
 ]
 
 TOKEN_FILE = "token.json"

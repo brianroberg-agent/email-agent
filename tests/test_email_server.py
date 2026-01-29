@@ -399,7 +399,7 @@ class TestAskAboutEndpoint:
 class TestMarkReadEndpoint:
     """Tests for the /mark-read endpoint."""
 
-    @patch("email_server.get_gmail_service_with_labels")
+    @patch("email_server.get_gmail_service_with_modify")
     def test_mark_read_success(self, mock_get_service, client):
         mock_service = Mock()
         mock_get_service.return_value = mock_service
@@ -416,7 +416,7 @@ class TestMarkReadEndpoint:
         assert call_kwargs["id"] == "msg123"
         assert call_kwargs["body"] == {"removeLabelIds": ["UNREAD"]}
 
-    @patch("email_server.get_gmail_service_with_labels")
+    @patch("email_server.get_gmail_service_with_modify")
     @pytest.mark.parametrize("error_message", [
         "Gmail API error",
         "Message not found",
@@ -432,7 +432,7 @@ class TestMarkReadEndpoint:
 class TestApplyLabelEndpoint:
     """Tests for the /apply-label endpoint."""
 
-    @patch("email_server.get_gmail_service_with_labels")
+    @patch("email_server.get_gmail_service_with_modify")
     @pytest.mark.parametrize("label", ["STARRED", "IMPORTANT", "CATEGORY_PERSONAL", "CATEGORY_WORK"])
     def test_apply_label_success(self, mock_get_service, client, label):
         mock_service = Mock()
@@ -451,7 +451,7 @@ class TestApplyLabelEndpoint:
         call_kwargs = mock_service.users.return_value.messages.return_value.modify.call_args[1]
         assert call_kwargs["body"] == {"addLabelIds": [label]}
 
-    @patch("email_server.get_gmail_service_with_labels")
+    @patch("email_server.get_gmail_service_with_modify")
     def test_apply_label_handles_error(self, mock_get_service, client):
         mock_get_service.side_effect = Exception("Label not found")
 
@@ -465,7 +465,7 @@ class TestApplyLabelEndpoint:
 class TestArchiveEndpoint:
     """Tests for the /archive endpoint."""
 
-    @patch("email_server.get_gmail_service_with_labels")
+    @patch("email_server.get_gmail_service_with_modify")
     def test_archive_success(self, mock_get_service, client):
         mock_service = Mock()
         mock_get_service.return_value = mock_service
@@ -480,7 +480,7 @@ class TestArchiveEndpoint:
         call_kwargs = mock_service.users.return_value.messages.return_value.modify.call_args[1]
         assert call_kwargs["body"] == {"removeLabelIds": ["INBOX"]}
 
-    @patch("email_server.get_gmail_service_with_labels")
+    @patch("email_server.get_gmail_service_with_modify")
     def test_archive_handles_error(self, mock_get_service, client):
         mock_get_service.side_effect = Exception("Gmail API error")
 
@@ -859,7 +859,7 @@ class TestBatchSummarizeEndpoint:
 class TestBulkActionsEndpoint:
     """Tests for the /bulk-actions endpoint with per-email actions format."""
 
-    @patch("email_server.get_gmail_service_with_labels")
+    @patch("email_server.get_gmail_service_with_modify")
     def test_bulk_actions_mark_read(self, mock_get_service, client):
         mock_service = Mock()
         mock_get_service.return_value = mock_service
@@ -879,7 +879,7 @@ class TestBulkActionsEndpoint:
         assert len(data["results"]) == 2
         assert all(r["success"] for r in data["results"])
 
-    @patch("email_server.get_gmail_service_with_labels")
+    @patch("email_server.get_gmail_service_with_modify")
     def test_bulk_actions_archive(self, mock_get_service, client):
         mock_service = Mock()
         mock_get_service.return_value = mock_service
@@ -895,7 +895,7 @@ class TestBulkActionsEndpoint:
         call_kwargs = mock_service.users.return_value.messages.return_value.modify.call_args[1]
         assert call_kwargs["body"] == {"removeLabelIds": ["INBOX"]}
 
-    @patch("email_server.get_gmail_service_with_labels")
+    @patch("email_server.get_gmail_service_with_modify")
     def test_bulk_actions_apply_label(self, mock_get_service, client):
         mock_service = Mock()
         mock_get_service.return_value = mock_service
@@ -911,7 +911,7 @@ class TestBulkActionsEndpoint:
         call_kwargs = mock_service.users.return_value.messages.return_value.modify.call_args[1]
         assert call_kwargs["body"] == {"addLabelIds": ["IMPORTANT"]}
 
-    @patch("email_server.get_gmail_service_with_labels")
+    @patch("email_server.get_gmail_service_with_modify")
     def test_bulk_actions_multiple_operations_per_email(self, mock_get_service, client):
         mock_service = Mock()
         mock_get_service.return_value = mock_service
@@ -928,7 +928,7 @@ class TestBulkActionsEndpoint:
         # Should have been called 3 times (once per operation)
         assert mock_service.users.return_value.messages.return_value.modify.call_count == 3
 
-    @patch("email_server.get_gmail_service_with_labels")
+    @patch("email_server.get_gmail_service_with_modify")
     def test_bulk_actions_different_operations_per_email(self, mock_get_service, client):
         """Test that each email can have different operations."""
         mock_service = Mock()
@@ -949,7 +949,7 @@ class TestBulkActionsEndpoint:
         # 1 + 2 + 2 = 5 total operations
         assert mock_service.users.return_value.messages.return_value.modify.call_count == 5
 
-    @patch("email_server.get_gmail_service_with_labels")
+    @patch("email_server.get_gmail_service_with_modify")
     def test_bulk_actions_partial_failure(self, mock_get_service, client):
         mock_service = Mock()
         mock_get_service.return_value = mock_service
@@ -980,7 +980,7 @@ class TestBulkActionsEndpoint:
         assert data["results"][1]["success"] is False
         assert "Permission denied" in data["results"][1]["error"]
 
-    @patch("email_server.get_gmail_service_with_labels")
+    @patch("email_server.get_gmail_service_with_modify")
     def test_bulk_actions_unknown_operation(self, mock_get_service, client):
         mock_service = Mock()
         mock_get_service.return_value = mock_service
@@ -996,7 +996,7 @@ class TestBulkActionsEndpoint:
         assert data["error_count"] == 1
         assert "Unknown operation" in data["results"][0]["error"]
 
-    @patch("email_server.get_gmail_service_with_labels")
+    @patch("email_server.get_gmail_service_with_modify")
     def test_bulk_actions_apply_label_empty_name(self, mock_get_service, client):
         """apply_label: with empty label name should return an error."""
         mock_service = Mock()
@@ -1015,7 +1015,7 @@ class TestBulkActionsEndpoint:
         # No Gmail API calls should be made
         mock_service.users.return_value.messages.return_value.modify.assert_not_called()
 
-    @patch("email_server.get_gmail_service_with_labels")
+    @patch("email_server.get_gmail_service_with_modify")
     def test_bulk_actions_handles_service_error(self, mock_get_service, client):
         mock_get_service.side_effect = Exception("Gmail service unavailable")
 
@@ -1045,7 +1045,7 @@ class TestBulkActionsEndpoint:
         })
         assert response.status_code == 422
 
-    @patch("email_server.get_gmail_service_with_labels")
+    @patch("email_server.get_gmail_service_with_modify")
     def test_bulk_actions_empty_actions_list(self, mock_get_service, client):
         mock_service = Mock()
         mock_get_service.return_value = mock_service
@@ -1058,7 +1058,7 @@ class TestBulkActionsEndpoint:
         assert data["error_count"] == 0
         assert data["results"] == []
 
-    @patch("email_server.get_gmail_service_with_labels")
+    @patch("email_server.get_gmail_service_with_modify")
     def test_bulk_actions_empty_operations_for_email(self, mock_get_service, client):
         """Empty operations array for an email should succeed with no ops performed."""
         mock_service = Mock()

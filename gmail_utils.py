@@ -23,11 +23,11 @@ def get_gmail_service():
     return build("gmail", "v1", credentials=creds)
 
 
-def get_gmail_service_with_labels():
-    """Creates authenticated Gmail service with labels scope."""
+def get_gmail_service_with_modify():
+    """Creates authenticated Gmail service with modify scope."""
     creds = Credentials.from_authorized_user_file(
         "token.json",
-        scopes=["https://www.googleapis.com/auth/gmail.labels"],
+        scopes=["https://www.googleapis.com/auth/gmail.modify"],
     )
     if creds.expired and creds.refresh_token:
         creds.refresh(Request())
