@@ -529,8 +529,9 @@ class TestApplyLabelEndpoint:
     """Tests for the /apply-label endpoint."""
 
     @patch("email_server.get_gmail_client")
-    @pytest.mark.parametrize("label", ["STARRED", "IMPORTANT", "CATEGORY_PERSONAL", "CATEGORY_WORK"])
-    def test_apply_label_success(self, mock_get_client, client, label):
+    @pytest.mark.parametrize("label", ["STARRED", "IMPORTANT", "CATEGORY_PERSONAL", "CATEGORY_UPDATES"])
+    def test_apply_label_success_system_labels(self, mock_get_client, client, label):
+        """Test applying system labels (IDs match names)."""
         mock_proxy_client = AsyncMock()
         mock_get_client.return_value = mock_proxy_client
 
@@ -545,15 +546,61 @@ class TestApplyLabelEndpoint:
         assert label in data["message"]
 
         call_kwargs = mock_proxy_client.modify_message.call_args[1]
-        assert call_kwargs["add_label_ids"] == [label]
+        assert call_kwargs["add_label_ids"] == [label.upper()]
 
     @patch("email_server.get_gmail_client")
-    def test_apply_label_handles_error(self, mock_get_client, client):
-        mock_get_client.side_effect = Exception("Label not found")
+    def test_apply_label_success_user_label(self, mock_get_client, client):
+        """Test applying user labels (requires ID lookup)."""
+        mock_proxy_client = AsyncMock()
+        mock_get_client.return_value = mock_proxy_client
+        mock_proxy_client.list_labels.return_value = {
+            "labels": [
+                {"id": "Label_123", "name": "response-required", "type": "user"},
+                {"id": "Label_456", "name": "work", "type": "user"},
+            ]
+        }
 
         response = client.post("/apply-label", json={
             "email_id": "msg123",
-            "label_name": "NONEXISTENT"
+            "label_name": "response-required"
+        })
+        assert response.status_code == 200
+
+        data = response.json()
+        assert data["success"] is True
+        assert "response-required" in data["message"]
+
+        call_kwargs = mock_proxy_client.modify_message.call_args[1]
+        assert call_kwargs["add_label_ids"] == ["Label_123"]
+
+    @patch("email_server.get_gmail_client")
+    def test_apply_label_not_found(self, mock_get_client, client):
+        """Test applying a label that doesn't exist."""
+        mock_proxy_client = AsyncMock()
+        mock_get_client.return_value = mock_proxy_client
+        mock_proxy_client.list_labels.return_value = {
+            "labels": [
+                {"id": "Label_123", "name": "existing-label", "type": "user"},
+            ]
+        }
+
+        response = client.post("/apply-label", json={
+            "email_id": "msg123",
+            "label_name": "nonexistent-label"
+        })
+        assert response.status_code == 400
+        assert "not found" in response.json()["detail"]
+
+    @patch("email_server.get_gmail_client")
+    def test_apply_label_handles_proxy_error(self, mock_get_client, client):
+        """Test that proxy errors are properly handled."""
+        mock_proxy_client = AsyncMock()
+        mock_get_client.return_value = mock_proxy_client
+        mock_proxy_client.modify_message.side_effect = Exception("Connection error")
+
+        response = client.post("/apply-label", json={
+            "email_id": "msg123",
+            "label_name": "STARRED"
         })
         assert response.status_code == 500
 
@@ -1008,6 +1055,11 @@ class TestBulkActionsEndpoint:
     def test_bulk_actions_multiple_operations_per_email(self, mock_get_client, client):
         mock_proxy_client = AsyncMock()
         mock_get_client.return_value = mock_proxy_client
+        mock_proxy_client.list_labels.return_value = {
+            "labels": [
+                {"id": "Label_789", "name": "PROCESSED", "type": "user"},
+            ]
+        }
 
         response = client.post("/bulk-actions", json={
             "actions": [

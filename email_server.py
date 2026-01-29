@@ -333,6 +333,41 @@ def format_proxy_error(e: Exception) -> str:
     return str(e)
 
 
+async def resolve_label_id(client, label_name: str) -> str:
+    """Resolve a label name to its Gmail label ID.
+
+    Gmail API requires label IDs for modify operations. System labels (STARRED,
+    INBOX, etc.) have IDs matching their names, but user-created labels have
+    IDs like 'Label_123456789'.
+
+    Args:
+        client: GmailProxyClient instance
+        label_name: The label name to resolve (e.g., 'response-required' or 'STARRED')
+
+    Returns:
+        The label ID to use with Gmail API.
+
+    Raises:
+        ValueError: If the label name is not found.
+    """
+    # System labels have IDs matching their names - check common ones first
+    system_labels = {
+        "INBOX", "STARRED", "IMPORTANT", "SENT", "DRAFT", "SPAM", "TRASH",
+        "UNREAD", "CATEGORY_PERSONAL", "CATEGORY_SOCIAL", "CATEGORY_PROMOTIONS",
+        "CATEGORY_UPDATES", "CATEGORY_FORUMS",
+    }
+    if label_name.upper() in system_labels:
+        return label_name.upper()
+
+    # For user labels, look up the ID from the labels list
+    result = await client.list_labels()
+    for label in result.get("labels", []):
+        if label.get("name") == label_name:
+            return label.get("id")
+
+    raise ValueError(f"Label '{label_name}' not found")
+
+
 async def apply_single_operation(client, email_id: str, operation: str) -> tuple[bool, str]:
     """Apply one operation to an email.
 
@@ -353,10 +388,13 @@ async def apply_single_operation(client, email_id: str, operation: str) -> tuple
             label_name = operation.split(":", 1)[1]
             if not label_name:
                 return False, "apply_label requires a label name (e.g., 'apply_label:IMPORTANT')"
-            await client.modify_message(email_id, add_label_ids=[label_name])
+            label_id = await resolve_label_id(client, label_name)
+            await client.modify_message(email_id, add_label_ids=[label_id])
         else:
             return False, f"Unknown operation: {operation}"
         return True, ""
+    except ValueError as e:
+        return False, str(e)
     except Exception as e:
         return False, format_proxy_error(e)
 
@@ -503,9 +541,12 @@ async def apply_label(request: ApplyLabelRequest):
     """Apply a label to an email."""
     try:
         client = get_gmail_client()
-        await client.modify_message(request.email_id, add_label_ids=[request.label_name])
+        label_id = await resolve_label_id(client, request.label_name)
+        await client.modify_message(request.email_id, add_label_ids=[label_id])
         return ActionResponse(success=True, message=f"Label '{request.label_name}' applied")
 
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
         raise HTTPException(status_code=500, detail=format_proxy_error(e))
 
