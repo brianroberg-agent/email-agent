@@ -11,12 +11,18 @@ Claude Code (cloud, orchestrator)
     ▼
 email_server.py (local FastAPI server, port 8081)
     │                        │
-    │ Gmail API (OAuth)      │ Local LLM (MLX, port 8080)
+    │ Proxy API (API key)    │ Local LLM (MLX, port 8080)
     ▼                        ▼
-Gmail                   Qwen3-14B (summarize/ask-about only)
+api-proxy (handles OAuth)   Qwen3-14B (summarize/ask-about only)
+    │
+    │ Gmail API (OAuth)
+    ▼
+Gmail
 ```
 
 **Privacy guarantee**: Email bodies are processed locally and never sent to cloud services. The calling agent only sees message IDs, dates, sender addresses, subject lines, snippets (~100 chars), labels, and LLM-generated summaries.
+
+**Human-in-the-loop**: The proxy server handles all confirmation flows for write operations. Dangerous operations (sending email, drafts) are blocked at the proxy level.
 
 ## Installation
 
@@ -26,8 +32,29 @@ No separate install step needed. The `uv run` command automatically manages depe
 
 - Python 3.10+
 - [uv](https://github.com/astral-sh/uv) package manager
-- Gmail OAuth credentials (`token.json`)
+- Access to an [api-proxy](https://github.com/brianroberg/api-proxy) server with a valid API key
 - Local LLM server (optional, for `/summarize` and `/ask-about` endpoints)
+
+## Configuration
+
+1. Copy `.env.example` to `.env`:
+   ```bash
+   cp .env.example .env
+   ```
+
+2. Edit `.env` and add your proxy API key:
+   ```
+   PROXY_API_KEY=aproxy_your_api_key_here
+   ```
+
+### Environment Variables
+
+| Variable | Required | Default | Description |
+|----------|----------|---------|-------------|
+| `PROXY_API_KEY` | Yes | - | API key for proxy authentication (format: `aproxy_...`) |
+| `PROXY_URL` | No | `http://host.docker.internal:8000` | URL of the proxy server |
+| `MLX_URL` | No | `http://localhost:8080/v1/chat/completions` | Local LLM endpoint |
+| `MLX_MODEL` | No | `qwen/qwen3-14b` | Model name for LLM requests |
 
 ## Usage
 
@@ -37,7 +64,7 @@ Start the server:
 uv run uvicorn email_server:app --host 0.0.0.0 --port 8081
 ```
 
-The server must be started from the directory containing `token.json`.
+Ensure the proxy server is running and accessible at the configured `PROXY_URL`.
 
 ## API Endpoints
 
@@ -270,23 +297,41 @@ Response:
 }
 ```
 
-## Configuration
+## Proxy Server
 
-Environment variables:
+This server requires access to an [api-proxy](https://github.com/brianroberg/api-proxy) instance that handles Gmail OAuth and human-in-the-loop controls.
 
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `MLX_URL` | `http://localhost:8080/v1/chat/completions` | Local LLM endpoint |
-| `MLX_MODEL` | `qwen/qwen3-14b` | Model name for LLM requests |
+### Allowed Operations
 
-## Gmail OAuth Setup
+The proxy permits these Gmail API operations:
+- List and retrieve messages
+- List and retrieve labels
+- Modify message labels (add/remove)
+- Trash/untrash messages
 
-1. Create a Google Cloud project and enable the Gmail API
-2. Create OAuth 2.0 credentials (Desktop app type)
-3. Download the credentials and run the OAuth flow to generate `token.json`
-4. Place `token.json` in the project directory
+### Blocked Operations
 
-**Note**: Do not commit `token.json` to version control.
+The proxy blocks these operations (returns 403 Forbidden):
+- Sending email
+- Creating, modifying, or sending drafts
+- Importing or inserting messages
+
+### Error Responses
+
+When the proxy returns an error, endpoints return it in the response body:
+
+```json
+{
+  "success": false,
+  "error": "Authentication error: Invalid API key",
+  "messages": []
+}
+```
+
+Error prefixes indicate the type:
+- `Authentication error:` - Invalid or missing API key (proxy returned 401)
+- `Operation blocked:` - Operation not allowed or confirmation rejected (proxy returned 403)
+- `Proxy error:` - Backend or server error (proxy returned 5xx)
 
 ## Development
 
@@ -296,7 +341,7 @@ Run tests:
 uv run --extra dev pytest tests/ -v
 ```
 
-The test suite uses mocked Gmail API and LLM responses - no credentials required.
+The test suite uses mocked proxy client and LLM responses - no credentials required.
 
 ## License
 
