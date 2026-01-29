@@ -29,6 +29,113 @@ class TestHealthEndpoint:
         assert set(data.keys()) == {"status", "version"}
 
 
+class TestLabelsEndpoint:
+    """Tests for the /labels endpoint."""
+
+    @patch("email_server.get_gmail_client")
+    def test_labels_returns_all_labels(self, mock_get_client, client):
+        mock_proxy_client = AsyncMock()
+        mock_get_client.return_value = mock_proxy_client
+
+        mock_proxy_client.list_labels.return_value = {
+            "labels": [
+                {
+                    "id": "INBOX",
+                    "name": "INBOX",
+                    "type": "system",
+                    "messagesTotal": 150,
+                    "messagesUnread": 5,
+                },
+                {
+                    "id": "Label_123",
+                    "name": "Work",
+                    "type": "user",
+                    "messagesTotal": 42,
+                    "messagesUnread": 3,
+                },
+            ]
+        }
+
+        response = client.get("/labels")
+        assert response.status_code == 200
+        data = response.json()
+        assert data["success"] is True
+        assert len(data["labels"]) == 2
+
+        # Check system label
+        inbox = data["labels"][0]
+        assert inbox["id"] == "INBOX"
+        assert inbox["name"] == "INBOX"
+        assert inbox["type"] == "system"
+        assert inbox["messages_total"] == 150
+        assert inbox["messages_unread"] == 5
+
+        # Check user label
+        work = data["labels"][1]
+        assert work["id"] == "Label_123"
+        assert work["name"] == "Work"
+        assert work["type"] == "user"
+
+    @patch("email_server.get_gmail_client")
+    def test_labels_handles_missing_counts(self, mock_get_client, client):
+        """Test that labels without message counts return null (not 0)."""
+        mock_proxy_client = AsyncMock()
+        mock_get_client.return_value = mock_proxy_client
+
+        mock_proxy_client.list_labels.return_value = {
+            "labels": [
+                {
+                    "id": "STARRED",
+                    "name": "STARRED",
+                    "type": "system",
+                    # No messagesTotal or messagesUnread
+                },
+            ]
+        }
+
+        response = client.get("/labels")
+        assert response.status_code == 200
+        data = response.json()
+        assert data["success"] is True
+
+        starred = data["labels"][0]
+        assert starred["messages_total"] is None
+        assert starred["messages_unread"] is None
+
+    @patch("email_server.get_gmail_client")
+    def test_labels_empty_list(self, mock_get_client, client):
+        mock_proxy_client = AsyncMock()
+        mock_get_client.return_value = mock_proxy_client
+        mock_proxy_client.list_labels.return_value = {"labels": []}
+
+        response = client.get("/labels")
+        assert response.status_code == 200
+        data = response.json()
+        assert data["success"] is True
+        assert data["labels"] == []
+
+    @patch("email_server.get_gmail_client")
+    def test_labels_handles_error(self, mock_get_client, client):
+        mock_get_client.side_effect = Exception("Proxy connection failed")
+
+        response = client.get("/labels")
+        assert response.status_code == 200
+        data = response.json()
+        assert data["success"] is False
+        assert data["labels"] == []
+        assert "Proxy connection failed" in data["error"]
+
+    def test_labels_response_structure(self, client):
+        with patch("email_server.get_gmail_client") as mock_get_client:
+            mock_proxy_client = AsyncMock()
+            mock_get_client.return_value = mock_proxy_client
+            mock_proxy_client.list_labels.return_value = {"labels": []}
+
+            response = client.get("/labels")
+            data = response.json()
+            assert set(data.keys()) == {"success", "labels", "error"}
+
+
 class TestSearchEndpoint:
     """Tests for the /search endpoint."""
 

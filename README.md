@@ -81,6 +81,40 @@ Response:
 {"status": "ok", "version": "2.0"}
 ```
 
+### GET /labels
+
+List all available Gmail labels with message counts.
+
+```bash
+curl http://localhost:8081/labels
+```
+
+Response:
+```json
+{
+  "success": true,
+  "labels": [
+    {
+      "id": "INBOX",
+      "name": "INBOX",
+      "type": "system",
+      "messages_total": 150,
+      "messages_unread": 5
+    },
+    {
+      "id": "Label_123",
+      "name": "Work",
+      "type": "user",
+      "messages_total": 42,
+      "messages_unread": 3
+    }
+  ],
+  "error": null
+}
+```
+
+Note: `messages_total` and `messages_unread` may be `null` for some labels when counts are unavailable.
+
 ### POST /search
 
 Search Gmail with structured parameters. Returns message metadata including snippets.

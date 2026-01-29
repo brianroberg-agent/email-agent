@@ -136,6 +136,20 @@ class HealthResponse(BaseModel):
     version: str
 
 
+class LabelInfo(BaseModel):
+    id: str
+    name: str
+    type: str
+    messages_total: Optional[int] = None
+    messages_unread: Optional[int] = None
+
+
+class LabelsResponse(BaseModel):
+    success: bool
+    labels: list[LabelInfo]
+    error: Optional[str] = None
+
+
 class DetectedAction(str, Enum):
     """Detected action types for email triage."""
     review_requested = "review_requested"
@@ -351,6 +365,33 @@ async def apply_single_operation(client, email_id: str, operation: str) -> tuple
 async def health():
     """Health check endpoint. No Gmail or LLM dependency."""
     return HealthResponse(status="ok", version="2.0")
+
+
+@app.get("/labels", response_model=LabelsResponse)
+async def labels():
+    """List all available Gmail labels.
+
+    Returns both system labels (INBOX, STARRED, etc.) and user-created labels
+    with message counts.
+    """
+    try:
+        client = get_gmail_client()
+        result = await client.list_labels()
+
+        label_list = []
+        for label in result.get("labels", []):
+            label_list.append(LabelInfo(
+                id=label.get("id", ""),
+                name=label.get("name", ""),
+                type=label.get("type", "user"),
+                messages_total=label.get("messagesTotal"),
+                messages_unread=label.get("messagesUnread"),
+            ))
+
+        return LabelsResponse(success=True, labels=label_list)
+
+    except Exception as e:
+        return LabelsResponse(success=False, labels=[], error=format_proxy_error(e))
 
 
 @app.post("/search", response_model=SearchResponse)
