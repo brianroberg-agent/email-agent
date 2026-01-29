@@ -18,7 +18,7 @@ from pydantic import BaseModel, Field
 
 from gmail_utils import (
     get_gmail_service,
-    get_gmail_service_with_modify,
+    get_gmail_service_with_labels,
     get_header,
     decode_body,
 )
@@ -463,7 +463,7 @@ async def ask_about(request: AskAboutRequest):
 async def mark_read(request: EmailIdRequest):
     """Mark an email as read by removing the UNREAD label."""
     try:
-        service = get_gmail_service_with_modify()
+        service = get_gmail_service_with_labels()
         service.users().messages().modify(
             userId="me",
             id=request.email_id,
@@ -479,7 +479,7 @@ async def mark_read(request: EmailIdRequest):
 async def apply_label(request: ApplyLabelRequest):
     """Apply a label to an email."""
     try:
-        service = get_gmail_service_with_modify()
+        service = get_gmail_service_with_labels()
         service.users().messages().modify(
             userId="me",
             id=request.email_id,
@@ -495,7 +495,7 @@ async def apply_label(request: ApplyLabelRequest):
 async def archive(request: EmailIdRequest):
     """Archive an email by removing it from the inbox."""
     try:
-        service = get_gmail_service_with_modify()
+        service = get_gmail_service_with_labels()
         service.users().messages().modify(
             userId="me",
             id=request.email_id,
@@ -590,7 +590,7 @@ async def bulk_actions(request: BulkActionsRequest):
     - apply_label:LABEL_NAME: Add the specified label
     """
     try:
-        service = get_gmail_service_with_modify()
+        service = get_gmail_service_with_labels()
         results = []
         success_count = 0
         error_count = 0
