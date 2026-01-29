@@ -49,12 +49,14 @@ The test suite uses mocked Gmail API and LLM responses - no credentials required
 ## API Endpoints
 
 - `GET /health` - Health check
-- `POST /search` - Search emails with structured filters
+- `POST /search` - Search emails with structured filters (returns from_name, has_attachments)
 - `POST /summarize` - Summarize an email (uses local LLM)
 - `POST /ask-about` - Ask a question about an email (uses local LLM)
 - `POST /mark-read` - Mark email as read
 - `POST /apply-label` - Apply a label to an email
 - `POST /archive` - Archive an email
+- `POST /batch-summarize` - Summarize multiple emails with triage info (detected_action, detected_deadline)
+- `POST /bulk-actions` - Apply multiple operations to multiple emails
 
 ## Environment Variables
 

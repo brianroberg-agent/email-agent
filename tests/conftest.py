@@ -124,4 +124,44 @@ SAMPLE_MESSAGES = {
             }
         }
     },
+    "with_attachment": {
+        "id": "msg_attach",
+        "threadId": "thread_attach",
+        "labelIds": ["INBOX", "UNREAD"],
+        "snippet": "Please find the document attached.",
+        "payload": {
+            "headers": [
+                {"name": "From", "value": "Documents Team <docs@example.com>"},
+                {"name": "Subject", "value": "Q4 Report Attached"},
+                {"name": "Date", "value": "Jan 28, 2026 2:00 PM"},
+            ],
+            "parts": [
+                {
+                    "mimeType": "text/plain",
+                    "body": {"data": _encode_body("Please find the Q4 report attached.")}
+                },
+                {
+                    "mimeType": "application/pdf",
+                    "filename": "Q4_Report.pdf",
+                    "body": {"attachmentId": "ANGjdJ8..."}
+                }
+            ]
+        }
+    },
+    "without_attachment": {
+        "id": "msg_no_attach",
+        "threadId": "thread_no_attach",
+        "labelIds": ["INBOX"],
+        "snippet": "Just a plain text email.",
+        "payload": {
+            "headers": [
+                {"name": "From", "value": "plain@example.com"},
+                {"name": "Subject", "value": "Plain Email"},
+                {"name": "Date", "value": "Jan 28, 2026 3:00 PM"},
+            ],
+            "body": {
+                "data": _encode_body("This is a plain text email with no attachments.")
+            }
+        }
+    },
 }
