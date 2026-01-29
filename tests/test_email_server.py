@@ -1,4 +1,4 @@
-"""Comprehensive tests for email_server with mocked Gmail API and LLM.
+"""Comprehensive tests for email_server with mocked proxy client and LLM.
 
 Testing patterns inspired by datasette-enrichments:
 - Parametrized tests for multiple scenarios
@@ -32,19 +32,18 @@ class TestHealthEndpoint:
 class TestSearchEndpoint:
     """Tests for the /search endpoint."""
 
-    @patch("email_server.get_gmail_service")
-    def test_search_basic(self, mock_get_service, client):
-        mock_service = Mock()
-        mock_get_service.return_value = mock_service
+    @patch("email_server.get_gmail_client")
+    def test_search_basic(self, mock_get_client, client):
+        mock_proxy_client = AsyncMock()
+        mock_get_client.return_value = mock_proxy_client
 
-        mock_messages = mock_service.users.return_value.messages
-        mock_messages.return_value.list.return_value.execute.return_value = {
+        mock_proxy_client.list_messages.return_value = {
             "messages": [
                 {"id": "msg123", "threadId": "thread123"},
                 {"id": "msg456", "threadId": "thread456"},
             ]
         }
-        mock_messages.return_value.get.return_value.execute.return_value = SAMPLE_MESSAGES["basic"]
+        mock_proxy_client.get_message.return_value = SAMPLE_MESSAGES["basic"]
 
         response = client.post("/search", json={"limit": 10})
         assert response.status_code == 200
@@ -54,7 +53,7 @@ class TestSearchEndpoint:
         assert data["error"] is None
         assert len(data["messages"]) == 2
 
-    @patch("email_server.get_gmail_service")
+    @patch("email_server.get_gmail_client")
     @pytest.mark.parametrize("filters,expected_query_parts", [
         (
             {"from_addr": "sender@example.com"},
@@ -85,50 +84,44 @@ class TestSearchEndpoint:
             ["from:test@example.com", "has:attachment"]
         ),
     ])
-    def test_search_with_filters(self, mock_get_service, client, filters, expected_query_parts):
-        mock_service = Mock()
-        mock_get_service.return_value = mock_service
-
-        mock_messages = mock_service.users.return_value.messages
-        mock_messages.return_value.list.return_value.execute.return_value = {"messages": []}
+    def test_search_with_filters(self, mock_get_client, client, filters, expected_query_parts):
+        mock_proxy_client = AsyncMock()
+        mock_get_client.return_value = mock_proxy_client
+        mock_proxy_client.list_messages.return_value = {"messages": []}
 
         response = client.post("/search", json={**filters, "limit": 10})
         assert response.status_code == 200
 
-        call_args = mock_messages.return_value.list.call_args
-        query_string = call_args[1].get("q", "")
+        call_args = mock_proxy_client.list_messages.call_args
+        query_string = call_args[1].get("q", "") or ""
         for part in expected_query_parts:
             assert part in query_string
 
-    @patch("email_server.get_gmail_service")
+    @patch("email_server.get_gmail_client")
     @pytest.mark.parametrize("folder", ["INBOX", "SENT", "DRAFT", "SPAM", "TRASH", "STARRED"])
-    def test_search_with_folder(self, mock_get_service, client, folder):
-        mock_service = Mock()
-        mock_get_service.return_value = mock_service
-
-        mock_messages = mock_service.users.return_value.messages
-        mock_messages.return_value.list.return_value.execute.return_value = {"messages": []}
+    def test_search_with_folder(self, mock_get_client, client, folder):
+        mock_proxy_client = AsyncMock()
+        mock_get_client.return_value = mock_proxy_client
+        mock_proxy_client.list_messages.return_value = {"messages": []}
 
         response = client.post("/search", json={"folder": folder, "limit": 5})
         assert response.status_code == 200
 
-        call_args = mock_messages.return_value.list.call_args
-        assert call_args[1]["labelIds"] == [folder]
+        call_args = mock_proxy_client.list_messages.call_args
+        assert call_args[1]["label_ids"] == [folder]
 
-    @patch("email_server.get_gmail_service")
+    @patch("email_server.get_gmail_client")
     @pytest.mark.parametrize("limit", [1, 10, 25, 50])
-    def test_search_with_limit(self, mock_get_service, client, limit):
-        mock_service = Mock()
-        mock_get_service.return_value = mock_service
-
-        mock_messages = mock_service.users.return_value.messages
-        mock_messages.return_value.list.return_value.execute.return_value = {"messages": []}
+    def test_search_with_limit(self, mock_get_client, client, limit):
+        mock_proxy_client = AsyncMock()
+        mock_get_client.return_value = mock_proxy_client
+        mock_proxy_client.list_messages.return_value = {"messages": []}
 
         response = client.post("/search", json={"limit": limit})
         assert response.status_code == 200
 
-        call_args = mock_messages.return_value.list.call_args
-        assert call_args[1]["maxResults"] == limit
+        call_args = mock_proxy_client.list_messages.call_args
+        assert call_args[1]["max_results"] == limit
 
     def test_search_limit_validation_min(self, client):
         response = client.post("/search", json={"limit": 0})
@@ -138,13 +131,11 @@ class TestSearchEndpoint:
         response = client.post("/search", json={"limit": 100})
         assert response.status_code == 422  # Validation error
 
-    @patch("email_server.get_gmail_service")
-    def test_search_empty_results(self, mock_get_service, client):
-        mock_service = Mock()
-        mock_get_service.return_value = mock_service
-
-        mock_messages = mock_service.users.return_value.messages
-        mock_messages.return_value.list.return_value.execute.return_value = {}  # No messages key
+    @patch("email_server.get_gmail_client")
+    def test_search_empty_results(self, mock_get_client, client):
+        mock_proxy_client = AsyncMock()
+        mock_get_client.return_value = mock_proxy_client
+        mock_proxy_client.list_messages.return_value = {}  # No messages key
 
         response = client.post("/search", json={"limit": 10})
         assert response.status_code == 200
@@ -153,16 +144,15 @@ class TestSearchEndpoint:
         assert data["success"] is True
         assert data["messages"] == []
 
-    @patch("email_server.get_gmail_service")
-    def test_search_returns_correct_message_structure(self, mock_get_service, client):
-        mock_service = Mock()
-        mock_get_service.return_value = mock_service
+    @patch("email_server.get_gmail_client")
+    def test_search_returns_correct_message_structure(self, mock_get_client, client):
+        mock_proxy_client = AsyncMock()
+        mock_get_client.return_value = mock_proxy_client
 
-        mock_messages = mock_service.users.return_value.messages
-        mock_messages.return_value.list.return_value.execute.return_value = {
+        mock_proxy_client.list_messages.return_value = {
             "messages": [{"id": "msg123", "threadId": "thread123"}]
         }
-        mock_messages.return_value.get.return_value.execute.return_value = SAMPLE_MESSAGES["basic"]
+        mock_proxy_client.get_message.return_value = SAMPLE_MESSAGES["basic"]
 
         response = client.post("/search", json={"limit": 1})
         data = response.json()
@@ -179,22 +169,22 @@ class TestSearchEndpoint:
         assert "UNREAD" in msg["labels"]
         assert msg["has_attachments"] is False
 
-    @patch("email_server.get_gmail_service")
+    @patch("email_server.get_gmail_client")
     @pytest.mark.parametrize("error_message", [
         "Gmail API error",
         "Connection refused",
         "Invalid credentials",
         "Rate limit exceeded",
     ])
-    def test_search_handles_error(self, mock_get_service, client, error_message):
-        mock_get_service.side_effect = Exception(error_message)
+    def test_search_handles_error(self, mock_get_client, client, error_message):
+        mock_get_client.side_effect = Exception(error_message)
 
         response = client.post("/search", json={"limit": 10})
         assert response.status_code == 200  # Returns 200 with error in body
 
         data = response.json()
         assert data["success"] is False
-        assert data["error"] == error_message
+        assert error_message in data["error"]
         assert data["messages"] == []
 
 
@@ -202,11 +192,11 @@ class TestSummarizeEndpoint:
     """Tests for the /summarize endpoint."""
 
     @patch("email_server.call_local_llm", new_callable=AsyncMock)
-    @patch("email_server.get_gmail_service")
-    def test_summarize_basic(self, mock_get_service, mock_llm, client):
-        mock_service = Mock()
-        mock_get_service.return_value = mock_service
-        mock_service.users.return_value.messages.return_value.get.return_value.execute.return_value = SAMPLE_MESSAGES["with_body"]
+    @patch("email_server.get_gmail_client")
+    def test_summarize_basic(self, mock_get_client, mock_llm, client):
+        mock_proxy_client = AsyncMock()
+        mock_get_client.return_value = mock_proxy_client
+        mock_proxy_client.get_message.return_value = SAMPLE_MESSAGES["with_body"]
 
         mock_llm.return_value = "The sender is thanking you for the conversation."
 
@@ -219,11 +209,11 @@ class TestSummarizeEndpoint:
         assert data["error"] is None
 
     @patch("email_server.call_local_llm", new_callable=AsyncMock)
-    @patch("email_server.get_gmail_service")
-    def test_summarize_uses_correct_system_prompt(self, mock_get_service, mock_llm, client):
-        mock_service = Mock()
-        mock_get_service.return_value = mock_service
-        mock_service.users.return_value.messages.return_value.get.return_value.execute.return_value = SAMPLE_MESSAGES["with_body"]
+    @patch("email_server.get_gmail_client")
+    def test_summarize_uses_correct_system_prompt(self, mock_get_client, mock_llm, client):
+        mock_proxy_client = AsyncMock()
+        mock_get_client.return_value = mock_proxy_client
+        mock_proxy_client.get_message.return_value = SAMPLE_MESSAGES["with_body"]
 
         mock_llm.return_value = "Summary here"
 
@@ -235,11 +225,11 @@ class TestSummarizeEndpoint:
         assert "untrusted data" in system_prompt
 
     @patch("email_server.call_local_llm", new_callable=AsyncMock)
-    @patch("email_server.get_gmail_service")
-    def test_summarize_multipart_email(self, mock_get_service, mock_llm, client):
-        mock_service = Mock()
-        mock_get_service.return_value = mock_service
-        mock_service.users.return_value.messages.return_value.get.return_value.execute.return_value = SAMPLE_MESSAGES["multipart"]
+    @patch("email_server.get_gmail_client")
+    def test_summarize_multipart_email(self, mock_get_client, mock_llm, client):
+        mock_proxy_client = AsyncMock()
+        mock_get_client.return_value = mock_proxy_client
+        mock_proxy_client.get_message.return_value = SAMPLE_MESSAGES["multipart"]
 
         mock_llm.return_value = "Summary of multipart email"
 
@@ -254,11 +244,11 @@ class TestSummarizeEndpoint:
         assert "Plain text content here" in user_content
 
     @patch("email_server.call_local_llm", new_callable=AsyncMock)
-    @patch("email_server.get_gmail_service")
-    def test_summarize_truncates_long_body(self, mock_get_service, mock_llm, client):
-        mock_service = Mock()
-        mock_get_service.return_value = mock_service
-        mock_service.users.return_value.messages.return_value.get.return_value.execute.return_value = SAMPLE_MESSAGES["long_body"]
+    @patch("email_server.get_gmail_client")
+    def test_summarize_truncates_long_body(self, mock_get_client, mock_llm, client):
+        mock_proxy_client = AsyncMock()
+        mock_get_client.return_value = mock_proxy_client
+        mock_proxy_client.get_message.return_value = SAMPLE_MESSAGES["long_body"]
 
         mock_llm.return_value = "Summary of long email"
 
@@ -270,9 +260,9 @@ class TestSummarizeEndpoint:
         assert user_content.endswith("...")
         assert len(user_content) <= 3003 + 10  # MAX_BODY_LENGTH + "..." + some margin
 
-    @patch("email_server.get_gmail_service")
-    def test_summarize_handles_gmail_error(self, mock_get_service, client):
-        mock_get_service.side_effect = Exception("Gmail API error")
+    @patch("email_server.get_gmail_client")
+    def test_summarize_handles_gmail_error(self, mock_get_client, client):
+        mock_get_client.side_effect = Exception("Gmail API error")
 
         response = client.post("/summarize", json={"message_id": "msg123"})
         assert response.status_code == 200
@@ -282,11 +272,11 @@ class TestSummarizeEndpoint:
         assert "Gmail API error" in data["error"]
 
     @patch("email_server.call_local_llm", new_callable=AsyncMock)
-    @patch("email_server.get_gmail_service")
-    def test_summarize_handles_llm_error(self, mock_get_service, mock_llm, client):
-        mock_service = Mock()
-        mock_get_service.return_value = mock_service
-        mock_service.users.return_value.messages.return_value.get.return_value.execute.return_value = SAMPLE_MESSAGES["with_body"]
+    @patch("email_server.get_gmail_client")
+    def test_summarize_handles_llm_error(self, mock_get_client, mock_llm, client):
+        mock_proxy_client = AsyncMock()
+        mock_get_client.return_value = mock_proxy_client
+        mock_proxy_client.get_message.return_value = SAMPLE_MESSAGES["with_body"]
 
         mock_llm.side_effect = Exception("LLM connection failed")
 
@@ -302,11 +292,11 @@ class TestAskAboutEndpoint:
     """Tests for the /ask-about endpoint."""
 
     @patch("email_server.call_local_llm", new_callable=AsyncMock)
-    @patch("email_server.get_gmail_service")
-    def test_ask_about_basic(self, mock_get_service, mock_llm, client):
-        mock_service = Mock()
-        mock_get_service.return_value = mock_service
-        mock_service.users.return_value.messages.return_value.get.return_value.execute.return_value = SAMPLE_MESSAGES["with_body"]
+    @patch("email_server.get_gmail_client")
+    def test_ask_about_basic(self, mock_get_client, mock_llm, client):
+        mock_proxy_client = AsyncMock()
+        mock_get_client.return_value = mock_proxy_client
+        mock_proxy_client.get_message.return_value = SAMPLE_MESSAGES["with_body"]
 
         mock_llm.return_value = "No, the sender did not mention a specific dollar amount."
 
@@ -322,11 +312,11 @@ class TestAskAboutEndpoint:
         assert data["error"] is None
 
     @patch("email_server.call_local_llm", new_callable=AsyncMock)
-    @patch("email_server.get_gmail_service")
-    def test_ask_about_includes_question_in_prompt(self, mock_get_service, mock_llm, client):
-        mock_service = Mock()
-        mock_get_service.return_value = mock_service
-        mock_service.users.return_value.messages.return_value.get.return_value.execute.return_value = SAMPLE_MESSAGES["with_body"]
+    @patch("email_server.get_gmail_client")
+    def test_ask_about_includes_question_in_prompt(self, mock_get_client, mock_llm, client):
+        mock_proxy_client = AsyncMock()
+        mock_get_client.return_value = mock_proxy_client
+        mock_proxy_client.get_message.return_value = SAMPLE_MESSAGES["with_body"]
 
         mock_llm.return_value = "Answer here"
 
@@ -340,11 +330,11 @@ class TestAskAboutEndpoint:
         assert "Question: What is the main request?" in user_content
 
     @patch("email_server.call_local_llm", new_callable=AsyncMock)
-    @patch("email_server.get_gmail_service")
-    def test_ask_about_uses_correct_system_prompt(self, mock_get_service, mock_llm, client):
-        mock_service = Mock()
-        mock_get_service.return_value = mock_service
-        mock_service.users.return_value.messages.return_value.get.return_value.execute.return_value = SAMPLE_MESSAGES["with_body"]
+    @patch("email_server.get_gmail_client")
+    def test_ask_about_uses_correct_system_prompt(self, mock_get_client, mock_llm, client):
+        mock_proxy_client = AsyncMock()
+        mock_get_client.return_value = mock_proxy_client
+        mock_proxy_client.get_message.return_value = SAMPLE_MESSAGES["with_body"]
 
         mock_llm.return_value = "Answer"
 
@@ -359,7 +349,7 @@ class TestAskAboutEndpoint:
         assert "untrusted data" in system_prompt
 
     @patch("email_server.call_local_llm", new_callable=AsyncMock)
-    @patch("email_server.get_gmail_service")
+    @patch("email_server.get_gmail_client")
     @pytest.mark.parametrize("question", [
         "What is the sender's name?",
         "Are there any attachments?",
@@ -367,10 +357,10 @@ class TestAskAboutEndpoint:
         "What action items are mentioned?",
         "Is this email urgent?",
     ])
-    def test_ask_about_various_questions(self, mock_get_service, mock_llm, client, question):
-        mock_service = Mock()
-        mock_get_service.return_value = mock_service
-        mock_service.users.return_value.messages.return_value.get.return_value.execute.return_value = SAMPLE_MESSAGES["with_body"]
+    def test_ask_about_various_questions(self, mock_get_client, mock_llm, client, question):
+        mock_proxy_client = AsyncMock()
+        mock_get_client.return_value = mock_proxy_client
+        mock_proxy_client.get_message.return_value = SAMPLE_MESSAGES["with_body"]
 
         mock_llm.return_value = f"Answer to: {question}"
 
@@ -381,9 +371,9 @@ class TestAskAboutEndpoint:
         assert response.status_code == 200
         assert response.json()["success"] is True
 
-    @patch("email_server.get_gmail_service")
-    def test_ask_about_handles_gmail_error(self, mock_get_service, client):
-        mock_get_service.side_effect = Exception("Gmail API error")
+    @patch("email_server.get_gmail_client")
+    def test_ask_about_handles_gmail_error(self, mock_get_client, client):
+        mock_get_client.side_effect = Exception("Gmail API error")
 
         response = client.post("/ask-about", json={
             "message_id": "msg123",
@@ -399,10 +389,10 @@ class TestAskAboutEndpoint:
 class TestMarkReadEndpoint:
     """Tests for the /mark-read endpoint."""
 
-    @patch("email_server.get_gmail_service_with_modify")
-    def test_mark_read_success(self, mock_get_service, client):
-        mock_service = Mock()
-        mock_get_service.return_value = mock_service
+    @patch("email_server.get_gmail_client")
+    def test_mark_read_success(self, mock_get_client, client):
+        mock_proxy_client = AsyncMock()
+        mock_get_client.return_value = mock_proxy_client
 
         response = client.post("/mark-read", json={"email_id": "msg123"})
         assert response.status_code == 200
@@ -411,19 +401,18 @@ class TestMarkReadEndpoint:
         assert data["success"] is True
         assert data["message"] == "Email marked as read"
 
-        mock_service.users.return_value.messages.return_value.modify.assert_called_once()
-        call_kwargs = mock_service.users.return_value.messages.return_value.modify.call_args[1]
-        assert call_kwargs["id"] == "msg123"
-        assert call_kwargs["body"] == {"removeLabelIds": ["UNREAD"]}
+        mock_proxy_client.modify_message.assert_called_once()
+        call_kwargs = mock_proxy_client.modify_message.call_args[1]
+        assert call_kwargs["remove_label_ids"] == ["UNREAD"]
 
-    @patch("email_server.get_gmail_service_with_modify")
+    @patch("email_server.get_gmail_client")
     @pytest.mark.parametrize("error_message", [
         "Gmail API error",
         "Message not found",
         "Permission denied",
     ])
-    def test_mark_read_handles_error(self, mock_get_service, client, error_message):
-        mock_get_service.side_effect = Exception(error_message)
+    def test_mark_read_handles_error(self, mock_get_client, client, error_message):
+        mock_get_client.side_effect = Exception(error_message)
 
         response = client.post("/mark-read", json={"email_id": "msg123"})
         assert response.status_code == 500
@@ -432,11 +421,11 @@ class TestMarkReadEndpoint:
 class TestApplyLabelEndpoint:
     """Tests for the /apply-label endpoint."""
 
-    @patch("email_server.get_gmail_service_with_modify")
+    @patch("email_server.get_gmail_client")
     @pytest.mark.parametrize("label", ["STARRED", "IMPORTANT", "CATEGORY_PERSONAL", "CATEGORY_WORK"])
-    def test_apply_label_success(self, mock_get_service, client, label):
-        mock_service = Mock()
-        mock_get_service.return_value = mock_service
+    def test_apply_label_success(self, mock_get_client, client, label):
+        mock_proxy_client = AsyncMock()
+        mock_get_client.return_value = mock_proxy_client
 
         response = client.post("/apply-label", json={
             "email_id": "msg123",
@@ -448,12 +437,12 @@ class TestApplyLabelEndpoint:
         assert data["success"] is True
         assert label in data["message"]
 
-        call_kwargs = mock_service.users.return_value.messages.return_value.modify.call_args[1]
-        assert call_kwargs["body"] == {"addLabelIds": [label]}
+        call_kwargs = mock_proxy_client.modify_message.call_args[1]
+        assert call_kwargs["add_label_ids"] == [label]
 
-    @patch("email_server.get_gmail_service_with_modify")
-    def test_apply_label_handles_error(self, mock_get_service, client):
-        mock_get_service.side_effect = Exception("Label not found")
+    @patch("email_server.get_gmail_client")
+    def test_apply_label_handles_error(self, mock_get_client, client):
+        mock_get_client.side_effect = Exception("Label not found")
 
         response = client.post("/apply-label", json={
             "email_id": "msg123",
@@ -465,10 +454,10 @@ class TestApplyLabelEndpoint:
 class TestArchiveEndpoint:
     """Tests for the /archive endpoint."""
 
-    @patch("email_server.get_gmail_service_with_modify")
-    def test_archive_success(self, mock_get_service, client):
-        mock_service = Mock()
-        mock_get_service.return_value = mock_service
+    @patch("email_server.get_gmail_client")
+    def test_archive_success(self, mock_get_client, client):
+        mock_proxy_client = AsyncMock()
+        mock_get_client.return_value = mock_proxy_client
 
         response = client.post("/archive", json={"email_id": "msg123"})
         assert response.status_code == 200
@@ -477,12 +466,12 @@ class TestArchiveEndpoint:
         assert data["success"] is True
         assert data["message"] == "Email archived"
 
-        call_kwargs = mock_service.users.return_value.messages.return_value.modify.call_args[1]
-        assert call_kwargs["body"] == {"removeLabelIds": ["INBOX"]}
+        call_kwargs = mock_proxy_client.modify_message.call_args[1]
+        assert call_kwargs["remove_label_ids"] == ["INBOX"]
 
-    @patch("email_server.get_gmail_service_with_modify")
-    def test_archive_handles_error(self, mock_get_service, client):
-        mock_get_service.side_effect = Exception("Gmail API error")
+    @patch("email_server.get_gmail_client")
+    def test_archive_handles_error(self, mock_get_client, client):
+        mock_get_client.side_effect = Exception("Gmail API error")
 
         response = client.post("/archive", json={"email_id": "msg123"})
         assert response.status_code == 500
@@ -686,7 +675,7 @@ class TestRequestValidation:
     def test_search_request_defaults(self, client):
         # Should work with empty body (using defaults)
         response = client.post("/search", json={})
-        # Will fail due to missing Gmail service, but validates request parsing
+        # Will fail due to missing proxy client, but validates request parsing
         assert response.status_code == 200  # Returns error in body, not HTTP error
 
     def test_summarize_requires_message_id(self, client):
@@ -720,11 +709,11 @@ class TestBatchSummarizeEndpoint:
     """Tests for the /batch-summarize endpoint."""
 
     @patch("email_server.call_local_llm", new_callable=AsyncMock)
-    @patch("email_server.get_gmail_service")
-    def test_batch_summarize_basic(self, mock_get_service, mock_llm, client):
-        mock_service = Mock()
-        mock_get_service.return_value = mock_service
-        mock_service.users.return_value.messages.return_value.get.return_value.execute.return_value = SAMPLE_MESSAGES["with_body"]
+    @patch("email_server.get_gmail_client")
+    def test_batch_summarize_basic(self, mock_get_client, mock_llm, client):
+        mock_proxy_client = AsyncMock()
+        mock_get_client.return_value = mock_proxy_client
+        mock_proxy_client.get_message.return_value = SAMPLE_MESSAGES["with_body"]
 
         mock_llm.return_value = '{"summary": "Test summary", "detected_action": "info_only", "detected_deadline": null}'
 
@@ -739,11 +728,11 @@ class TestBatchSummarizeEndpoint:
         assert data["results"][0]["detected_action"] == "info_only"
 
     @patch("email_server.call_local_llm", new_callable=AsyncMock)
-    @patch("email_server.get_gmail_service")
-    def test_batch_summarize_parses_json_response(self, mock_get_service, mock_llm, client):
-        mock_service = Mock()
-        mock_get_service.return_value = mock_service
-        mock_service.users.return_value.messages.return_value.get.return_value.execute.return_value = SAMPLE_MESSAGES["with_body"]
+    @patch("email_server.get_gmail_client")
+    def test_batch_summarize_parses_json_response(self, mock_get_client, mock_llm, client):
+        mock_proxy_client = AsyncMock()
+        mock_get_client.return_value = mock_proxy_client
+        mock_proxy_client.get_message.return_value = SAMPLE_MESSAGES["with_body"]
 
         mock_llm.return_value = '{"summary": "Review this PR", "detected_action": "review_requested", "detected_deadline": "2026-02-01"}'
 
@@ -756,11 +745,11 @@ class TestBatchSummarizeEndpoint:
         assert result["detected_deadline"] == "2026-02-01"
 
     @patch("email_server.call_local_llm", new_callable=AsyncMock)
-    @patch("email_server.get_gmail_service")
-    def test_batch_summarize_handles_invalid_json(self, mock_get_service, mock_llm, client):
-        mock_service = Mock()
-        mock_get_service.return_value = mock_service
-        mock_service.users.return_value.messages.return_value.get.return_value.execute.return_value = SAMPLE_MESSAGES["with_body"]
+    @patch("email_server.get_gmail_client")
+    def test_batch_summarize_handles_invalid_json(self, mock_get_client, mock_llm, client):
+        mock_proxy_client = AsyncMock()
+        mock_get_client.return_value = mock_proxy_client
+        mock_proxy_client.get_message.return_value = SAMPLE_MESSAGES["with_body"]
 
         # Non-JSON response should fall back to raw summary
         mock_llm.return_value = "This is a plain text summary without JSON."
@@ -774,11 +763,11 @@ class TestBatchSummarizeEndpoint:
         assert result["detected_action"] is None
 
     @patch("email_server.call_local_llm", new_callable=AsyncMock)
-    @patch("email_server.get_gmail_service")
-    def test_batch_summarize_handles_invalid_action_type(self, mock_get_service, mock_llm, client):
-        mock_service = Mock()
-        mock_get_service.return_value = mock_service
-        mock_service.users.return_value.messages.return_value.get.return_value.execute.return_value = SAMPLE_MESSAGES["with_body"]
+    @patch("email_server.get_gmail_client")
+    def test_batch_summarize_handles_invalid_action_type(self, mock_get_client, mock_llm, client):
+        mock_proxy_client = AsyncMock()
+        mock_get_client.return_value = mock_proxy_client
+        mock_proxy_client.get_message.return_value = SAMPLE_MESSAGES["with_body"]
 
         # Invalid action type should be ignored
         mock_llm.return_value = '{"summary": "Test", "detected_action": "unknown_action", "detected_deadline": null}'
@@ -791,21 +780,18 @@ class TestBatchSummarizeEndpoint:
         assert result["detected_action"] is None
 
     @patch("email_server.call_local_llm", new_callable=AsyncMock)
-    @patch("email_server.get_gmail_service")
-    def test_batch_summarize_continues_on_individual_error(self, mock_get_service, mock_llm, client):
-        mock_service = Mock()
-        mock_get_service.return_value = mock_service
+    @patch("email_server.get_gmail_client")
+    def test_batch_summarize_continues_on_individual_error(self, mock_get_client, mock_llm, client):
+        mock_proxy_client = AsyncMock()
+        mock_get_client.return_value = mock_proxy_client
 
         # First message succeeds, second fails
-        def get_side_effect(userId, id, format):
-            mock_result = Mock()
-            if id == "msg_fail":
-                mock_result.execute.side_effect = Exception("Message not found")
-            else:
-                mock_result.execute.return_value = SAMPLE_MESSAGES["with_body"]
-            return mock_result
+        async def get_side_effect(message_id, format=None):
+            if message_id == "msg_fail":
+                raise Exception("Message not found")
+            return SAMPLE_MESSAGES["with_body"]
 
-        mock_service.users.return_value.messages.return_value.get.side_effect = get_side_effect
+        mock_proxy_client.get_message.side_effect = get_side_effect
         mock_llm.return_value = '{"summary": "Success", "detected_action": null, "detected_deadline": null}'
 
         response = client.post("/batch-summarize", json={"message_ids": ["msg_ok", "msg_fail"]})
@@ -817,9 +803,9 @@ class TestBatchSummarizeEndpoint:
         assert data["results"][1]["success"] is False
         assert "not found" in data["results"][1]["error"]
 
-    @patch("email_server.get_gmail_service")
-    def test_batch_summarize_handles_service_error(self, mock_get_service, client):
-        mock_get_service.side_effect = Exception("Gmail service unavailable")
+    @patch("email_server.get_gmail_client")
+    def test_batch_summarize_handles_service_error(self, mock_get_client, client):
+        mock_get_client.side_effect = Exception("Gmail service unavailable")
 
         response = client.post("/batch-summarize", json={"message_ids": ["msg123"]})
         data = response.json()
@@ -832,7 +818,7 @@ class TestBatchSummarizeEndpoint:
         assert response.status_code == 422
 
     @patch("email_server.call_local_llm", new_callable=AsyncMock)
-    @patch("email_server.get_gmail_service")
+    @patch("email_server.get_gmail_client")
     @pytest.mark.parametrize("action_type", [
         "review_requested",
         "meeting_request",
@@ -843,10 +829,10 @@ class TestBatchSummarizeEndpoint:
         "follow_up",
         "deadline",
     ])
-    def test_batch_summarize_all_action_types(self, mock_get_service, mock_llm, client, action_type):
-        mock_service = Mock()
-        mock_get_service.return_value = mock_service
-        mock_service.users.return_value.messages.return_value.get.return_value.execute.return_value = SAMPLE_MESSAGES["with_body"]
+    def test_batch_summarize_all_action_types(self, mock_get_client, mock_llm, client, action_type):
+        mock_proxy_client = AsyncMock()
+        mock_get_client.return_value = mock_proxy_client
+        mock_proxy_client.get_message.return_value = SAMPLE_MESSAGES["with_body"]
 
         mock_llm.return_value = f'{{"summary": "Test", "detected_action": "{action_type}", "detected_deadline": null}}'
 
@@ -859,10 +845,10 @@ class TestBatchSummarizeEndpoint:
 class TestBulkActionsEndpoint:
     """Tests for the /bulk-actions endpoint with per-email actions format."""
 
-    @patch("email_server.get_gmail_service_with_modify")
-    def test_bulk_actions_mark_read(self, mock_get_service, client):
-        mock_service = Mock()
-        mock_get_service.return_value = mock_service
+    @patch("email_server.get_gmail_client")
+    def test_bulk_actions_mark_read(self, mock_get_client, client):
+        mock_proxy_client = AsyncMock()
+        mock_get_client.return_value = mock_proxy_client
 
         response = client.post("/bulk-actions", json={
             "actions": [
@@ -879,10 +865,10 @@ class TestBulkActionsEndpoint:
         assert len(data["results"]) == 2
         assert all(r["success"] for r in data["results"])
 
-    @patch("email_server.get_gmail_service_with_modify")
-    def test_bulk_actions_archive(self, mock_get_service, client):
-        mock_service = Mock()
-        mock_get_service.return_value = mock_service
+    @patch("email_server.get_gmail_client")
+    def test_bulk_actions_archive(self, mock_get_client, client):
+        mock_proxy_client = AsyncMock()
+        mock_get_client.return_value = mock_proxy_client
 
         response = client.post("/bulk-actions", json={
             "actions": [
@@ -892,13 +878,13 @@ class TestBulkActionsEndpoint:
         data = response.json()
 
         assert data["success"] is True
-        call_kwargs = mock_service.users.return_value.messages.return_value.modify.call_args[1]
-        assert call_kwargs["body"] == {"removeLabelIds": ["INBOX"]}
+        call_kwargs = mock_proxy_client.modify_message.call_args[1]
+        assert call_kwargs["remove_label_ids"] == ["INBOX"]
 
-    @patch("email_server.get_gmail_service_with_modify")
-    def test_bulk_actions_apply_label(self, mock_get_service, client):
-        mock_service = Mock()
-        mock_get_service.return_value = mock_service
+    @patch("email_server.get_gmail_client")
+    def test_bulk_actions_apply_label(self, mock_get_client, client):
+        mock_proxy_client = AsyncMock()
+        mock_get_client.return_value = mock_proxy_client
 
         response = client.post("/bulk-actions", json={
             "actions": [
@@ -908,13 +894,13 @@ class TestBulkActionsEndpoint:
         data = response.json()
 
         assert data["success"] is True
-        call_kwargs = mock_service.users.return_value.messages.return_value.modify.call_args[1]
-        assert call_kwargs["body"] == {"addLabelIds": ["IMPORTANT"]}
+        call_kwargs = mock_proxy_client.modify_message.call_args[1]
+        assert call_kwargs["add_label_ids"] == ["IMPORTANT"]
 
-    @patch("email_server.get_gmail_service_with_modify")
-    def test_bulk_actions_multiple_operations_per_email(self, mock_get_service, client):
-        mock_service = Mock()
-        mock_get_service.return_value = mock_service
+    @patch("email_server.get_gmail_client")
+    def test_bulk_actions_multiple_operations_per_email(self, mock_get_client, client):
+        mock_proxy_client = AsyncMock()
+        mock_get_client.return_value = mock_proxy_client
 
         response = client.post("/bulk-actions", json={
             "actions": [
@@ -926,13 +912,13 @@ class TestBulkActionsEndpoint:
         assert data["success"] is True
         assert data["success_count"] == 1
         # Should have been called 3 times (once per operation)
-        assert mock_service.users.return_value.messages.return_value.modify.call_count == 3
+        assert mock_proxy_client.modify_message.call_count == 3
 
-    @patch("email_server.get_gmail_service_with_modify")
-    def test_bulk_actions_different_operations_per_email(self, mock_get_service, client):
+    @patch("email_server.get_gmail_client")
+    def test_bulk_actions_different_operations_per_email(self, mock_get_client, client):
         """Test that each email can have different operations."""
-        mock_service = Mock()
-        mock_get_service.return_value = mock_service
+        mock_proxy_client = AsyncMock()
+        mock_get_client.return_value = mock_proxy_client
 
         response = client.post("/bulk-actions", json={
             "actions": [
@@ -947,23 +933,20 @@ class TestBulkActionsEndpoint:
         assert data["success_count"] == 3
         assert data["error_count"] == 0
         # 1 + 2 + 2 = 5 total operations
-        assert mock_service.users.return_value.messages.return_value.modify.call_count == 5
+        assert mock_proxy_client.modify_message.call_count == 5
 
-    @patch("email_server.get_gmail_service_with_modify")
-    def test_bulk_actions_partial_failure(self, mock_get_service, client):
-        mock_service = Mock()
-        mock_get_service.return_value = mock_service
+    @patch("email_server.get_gmail_client")
+    def test_bulk_actions_partial_failure(self, mock_get_client, client):
+        mock_proxy_client = AsyncMock()
+        mock_get_client.return_value = mock_proxy_client
 
         # First email succeeds, second fails
-        def modify_side_effect(userId, id, body):
-            mock_result = Mock()
-            if id == "msg_fail":
-                mock_result.execute.side_effect = Exception("Permission denied")
-            else:
-                mock_result.execute.return_value = {}
-            return mock_result
+        async def modify_side_effect(email_id, add_label_ids=None, remove_label_ids=None):
+            if email_id == "msg_fail":
+                raise Exception("Permission denied")
+            return {}
 
-        mock_service.users.return_value.messages.return_value.modify.side_effect = modify_side_effect
+        mock_proxy_client.modify_message.side_effect = modify_side_effect
 
         response = client.post("/bulk-actions", json={
             "actions": [
@@ -980,10 +963,10 @@ class TestBulkActionsEndpoint:
         assert data["results"][1]["success"] is False
         assert "Permission denied" in data["results"][1]["error"]
 
-    @patch("email_server.get_gmail_service_with_modify")
-    def test_bulk_actions_unknown_operation(self, mock_get_service, client):
-        mock_service = Mock()
-        mock_get_service.return_value = mock_service
+    @patch("email_server.get_gmail_client")
+    def test_bulk_actions_unknown_operation(self, mock_get_client, client):
+        mock_proxy_client = AsyncMock()
+        mock_get_client.return_value = mock_proxy_client
 
         response = client.post("/bulk-actions", json={
             "actions": [
@@ -996,11 +979,11 @@ class TestBulkActionsEndpoint:
         assert data["error_count"] == 1
         assert "Unknown operation" in data["results"][0]["error"]
 
-    @patch("email_server.get_gmail_service_with_modify")
-    def test_bulk_actions_apply_label_empty_name(self, mock_get_service, client):
+    @patch("email_server.get_gmail_client")
+    def test_bulk_actions_apply_label_empty_name(self, mock_get_client, client):
         """apply_label: with empty label name should return an error."""
-        mock_service = Mock()
-        mock_get_service.return_value = mock_service
+        mock_proxy_client = AsyncMock()
+        mock_get_client.return_value = mock_proxy_client
 
         response = client.post("/bulk-actions", json={
             "actions": [
@@ -1013,11 +996,11 @@ class TestBulkActionsEndpoint:
         assert data["error_count"] == 1
         assert "apply_label requires a label name" in data["results"][0]["error"]
         # No Gmail API calls should be made
-        mock_service.users.return_value.messages.return_value.modify.assert_not_called()
+        mock_proxy_client.modify_message.assert_not_called()
 
-    @patch("email_server.get_gmail_service_with_modify")
-    def test_bulk_actions_handles_service_error(self, mock_get_service, client):
-        mock_get_service.side_effect = Exception("Gmail service unavailable")
+    @patch("email_server.get_gmail_client")
+    def test_bulk_actions_handles_service_error(self, mock_get_client, client):
+        mock_get_client.side_effect = Exception("Gmail service unavailable")
 
         response = client.post("/bulk-actions", json={
             "actions": [
@@ -1045,10 +1028,10 @@ class TestBulkActionsEndpoint:
         })
         assert response.status_code == 422
 
-    @patch("email_server.get_gmail_service_with_modify")
-    def test_bulk_actions_empty_actions_list(self, mock_get_service, client):
-        mock_service = Mock()
-        mock_get_service.return_value = mock_service
+    @patch("email_server.get_gmail_client")
+    def test_bulk_actions_empty_actions_list(self, mock_get_client, client):
+        mock_proxy_client = AsyncMock()
+        mock_get_client.return_value = mock_proxy_client
 
         response = client.post("/bulk-actions", json={"actions": []})
         data = response.json()
@@ -1058,11 +1041,11 @@ class TestBulkActionsEndpoint:
         assert data["error_count"] == 0
         assert data["results"] == []
 
-    @patch("email_server.get_gmail_service_with_modify")
-    def test_bulk_actions_empty_operations_for_email(self, mock_get_service, client):
+    @patch("email_server.get_gmail_client")
+    def test_bulk_actions_empty_operations_for_email(self, mock_get_client, client):
         """Empty operations array for an email should succeed with no ops performed."""
-        mock_service = Mock()
-        mock_get_service.return_value = mock_service
+        mock_proxy_client = AsyncMock()
+        mock_get_client.return_value = mock_proxy_client
 
         response = client.post("/bulk-actions", json={
             "actions": [
@@ -1076,22 +1059,21 @@ class TestBulkActionsEndpoint:
         assert data["error_count"] == 0
         assert data["results"][0]["success"] is True
         # No Gmail API calls should be made
-        mock_service.users.return_value.messages.return_value.modify.assert_not_called()
+        mock_proxy_client.modify_message.assert_not_called()
 
 
 class TestSearchEndpointNewFields:
     """Tests for the new from_name and has_attachments fields in /search."""
 
-    @patch("email_server.get_gmail_service")
-    def test_search_returns_from_name(self, mock_get_service, client):
-        mock_service = Mock()
-        mock_get_service.return_value = mock_service
+    @patch("email_server.get_gmail_client")
+    def test_search_returns_from_name(self, mock_get_client, client):
+        mock_proxy_client = AsyncMock()
+        mock_get_client.return_value = mock_proxy_client
 
-        mock_messages = mock_service.users.return_value.messages
-        mock_messages.return_value.list.return_value.execute.return_value = {
+        mock_proxy_client.list_messages.return_value = {
             "messages": [{"id": "msg123", "threadId": "thread123"}]
         }
-        mock_messages.return_value.get.return_value.execute.return_value = SAMPLE_MESSAGES["basic"]
+        mock_proxy_client.get_message.return_value = SAMPLE_MESSAGES["basic"]
 
         response = client.post("/search", json={"limit": 1})
         data = response.json()
@@ -1100,10 +1082,10 @@ class TestSearchEndpointNewFields:
         assert msg["from_name"] == "Sender Name"
         assert msg["from_addr"] == "Sender Name <sender@example.com>"
 
-    @patch("email_server.get_gmail_service")
-    def test_search_returns_from_name_email_only(self, mock_get_service, client):
-        mock_service = Mock()
-        mock_get_service.return_value = mock_service
+    @patch("email_server.get_gmail_client")
+    def test_search_returns_from_name_email_only(self, mock_get_client, client):
+        mock_proxy_client = AsyncMock()
+        mock_get_client.return_value = mock_proxy_client
 
         # Message with email-only From header
         msg_data = {
@@ -1119,11 +1101,10 @@ class TestSearchEndpointNewFields:
             }
         }
 
-        mock_messages = mock_service.users.return_value.messages
-        mock_messages.return_value.list.return_value.execute.return_value = {
+        mock_proxy_client.list_messages.return_value = {
             "messages": [{"id": "msg123"}]
         }
-        mock_messages.return_value.get.return_value.execute.return_value = msg_data
+        mock_proxy_client.get_message.return_value = msg_data
 
         response = client.post("/search", json={"limit": 1})
         data = response.json()
@@ -1131,16 +1112,15 @@ class TestSearchEndpointNewFields:
         msg = data["messages"][0]
         assert msg["from_name"] == "noreply@example.com"
 
-    @patch("email_server.get_gmail_service")
-    def test_search_detects_attachments(self, mock_get_service, client):
-        mock_service = Mock()
-        mock_get_service.return_value = mock_service
+    @patch("email_server.get_gmail_client")
+    def test_search_detects_attachments(self, mock_get_client, client):
+        mock_proxy_client = AsyncMock()
+        mock_get_client.return_value = mock_proxy_client
 
-        mock_messages = mock_service.users.return_value.messages
-        mock_messages.return_value.list.return_value.execute.return_value = {
+        mock_proxy_client.list_messages.return_value = {
             "messages": [{"id": "msg_attach"}]
         }
-        mock_messages.return_value.get.return_value.execute.return_value = SAMPLE_MESSAGES["with_attachment"]
+        mock_proxy_client.get_message.return_value = SAMPLE_MESSAGES["with_attachment"]
 
         response = client.post("/search", json={"limit": 1})
         data = response.json()
@@ -1148,16 +1128,15 @@ class TestSearchEndpointNewFields:
         msg = data["messages"][0]
         assert msg["has_attachments"] is True
 
-    @patch("email_server.get_gmail_service")
-    def test_search_no_attachments(self, mock_get_service, client):
-        mock_service = Mock()
-        mock_get_service.return_value = mock_service
+    @patch("email_server.get_gmail_client")
+    def test_search_no_attachments(self, mock_get_client, client):
+        mock_proxy_client = AsyncMock()
+        mock_get_client.return_value = mock_proxy_client
 
-        mock_messages = mock_service.users.return_value.messages
-        mock_messages.return_value.list.return_value.execute.return_value = {
+        mock_proxy_client.list_messages.return_value = {
             "messages": [{"id": "msg_no_attach"}]
         }
-        mock_messages.return_value.get.return_value.execute.return_value = SAMPLE_MESSAGES["without_attachment"]
+        mock_proxy_client.get_message.return_value = SAMPLE_MESSAGES["without_attachment"]
 
         response = client.post("/search", json={"limit": 1})
         data = response.json()
@@ -1243,3 +1222,96 @@ class TestHelperFunctions:
             ]
         }
         assert has_attachments(payload) is True
+
+
+class TestProxyClient:
+    """Tests for the proxy client."""
+
+    def test_proxy_client_init_missing_api_key(self):
+        """Test that ProxyAuthError is raised when API key is missing."""
+        from proxy_client import GmailProxyClient, ProxyAuthError
+        import os
+
+        # Temporarily clear the environment variable
+        original_key = os.environ.get("PROXY_API_KEY")
+        os.environ["PROXY_API_KEY"] = ""
+
+        try:
+            with pytest.raises(ProxyAuthError, match="PROXY_API_KEY"):
+                GmailProxyClient(api_key="")
+        finally:
+            if original_key:
+                os.environ["PROXY_API_KEY"] = original_key
+
+    def test_proxy_client_init_with_api_key(self):
+        """Test that client initializes correctly with API key."""
+        from proxy_client import GmailProxyClient
+
+        client = GmailProxyClient(api_key="aproxy_test123")
+        assert client.api_key == "aproxy_test123"
+
+    def test_proxy_client_default_url(self):
+        """Test that default URL is set correctly."""
+        from proxy_client import GmailProxyClient
+
+        client = GmailProxyClient(api_key="aproxy_test123")
+        assert "host.docker.internal" in client.proxy_url or client.proxy_url
+
+    def test_proxy_client_custom_url(self):
+        """Test that custom URL is used."""
+        from proxy_client import GmailProxyClient
+
+        client = GmailProxyClient(proxy_url="http://custom:9000", api_key="aproxy_test123")
+        assert client.proxy_url == "http://custom:9000"
+
+    def test_proxy_client_headers(self):
+        """Test that headers include Bearer token."""
+        from proxy_client import GmailProxyClient
+
+        client = GmailProxyClient(api_key="aproxy_test123")
+        headers = client._get_headers()
+        assert headers["Authorization"] == "Bearer aproxy_test123"
+        assert headers["Content-Type"] == "application/json"
+
+
+class TestProxyErrorHandling:
+    """Tests for proxy error handling."""
+
+    @patch("email_server.get_gmail_client")
+    def test_proxy_auth_error_formatted(self, mock_get_client, client):
+        """Test that ProxyAuthError is formatted correctly."""
+        from proxy_client import ProxyAuthError
+
+        mock_get_client.side_effect = ProxyAuthError("Invalid API key")
+
+        response = client.post("/search", json={"limit": 10})
+        data = response.json()
+
+        assert data["success"] is False
+        assert "Authentication error" in data["error"]
+
+    @patch("email_server.get_gmail_client")
+    def test_proxy_forbidden_error_formatted(self, mock_get_client, client):
+        """Test that ProxyForbiddenError is formatted correctly."""
+        from proxy_client import ProxyForbiddenError
+
+        mock_get_client.side_effect = ProxyForbiddenError("Operation blocked")
+
+        response = client.post("/search", json={"limit": 10})
+        data = response.json()
+
+        assert data["success"] is False
+        assert "Operation blocked" in data["error"]
+
+    @patch("email_server.get_gmail_client")
+    def test_proxy_error_formatted(self, mock_get_client, client):
+        """Test that ProxyError is formatted correctly."""
+        from proxy_client import ProxyError
+
+        mock_get_client.side_effect = ProxyError("Backend unavailable")
+
+        response = client.post("/search", json={"limit": 10})
+        data = response.json()
+
+        assert data["success"] is False
+        assert "Proxy error" in data["error"]

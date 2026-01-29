@@ -6,6 +6,8 @@ This file provides guidance to Claude Code when working with this project.
 
 This is an email agent server - a privacy-focused FastAPI wrapper around the Gmail API. Email bodies never leave the local machine; only metadata and LLM-generated summaries are returned to calling agents.
 
+The server communicates with Gmail through an API proxy that handles Google OAuth authentication and human-in-the-loop controls. The agent authenticates with the proxy using an API key.
+
 ## Package Management
 
 Use `uv` for package management. Dependencies are defined in `pyproject.toml`.
@@ -26,12 +28,14 @@ uv run --extra dev pytest tests/ -v
 uv run --extra dev pytest tests/ -v
 ```
 
-The test suite uses mocked Gmail API and LLM responses - no credentials required.
+The test suite uses mocked proxy client and LLM responses - no credentials required.
 
 ## Project Structure
 
 - `email_server.py` - Main FastAPI application with all endpoints
-- `gmail_utils.py` - Gmail API utilities (auth, header extraction, body decoding)
+- `proxy_client.py` - Gmail API proxy client (handles proxy authentication and requests)
+- `gmail_utils.py` - Gmail message parsing utilities (header extraction, body decoding)
+- `.env.example` - Template for environment variables
 - `tests/` - Test suite
   - `conftest.py` - Shared fixtures and sample data
   - `test_email_server.py` - Endpoint and utility tests
@@ -42,9 +46,11 @@ The test suite uses mocked Gmail API and LLM responses - no credentials required
 
 1. **Privacy**: Email bodies are processed locally via a local LLM (Qwen3-14B). The calling agent only sees metadata and summaries.
 
-2. **No agent loop**: Unlike the previous version, this server has no internal agent loop. The calling agent (Claude) makes all orchestration decisions.
+2. **Proxy Architecture**: All Gmail API requests go through a proxy server that handles Google OAuth and human-in-the-loop controls. The agent no longer possesses a Google auth token.
 
-3. **Structured endpoints**: Each operation has a dedicated endpoint rather than a single natural-language endpoint.
+3. **No agent loop**: The calling agent (Claude) makes all orchestration decisions.
+
+4. **Structured endpoints**: Each operation has a dedicated endpoint rather than a single natural-language endpoint.
 
 ## API Endpoints
 
@@ -60,5 +66,37 @@ The test suite uses mocked Gmail API and LLM responses - no credentials required
 
 ## Environment Variables
 
+Copy `.env.example` to `.env` and configure:
+
+- `PROXY_API_KEY` - **Required**. API key for authenticating with the proxy server (format: `aproxy_<32-chars>`)
+- `PROXY_URL` - URL of the proxy server (default: `http://host.docker.internal:8000`)
 - `MLX_URL` - Local LLM endpoint (default: `http://localhost:8080/v1/chat/completions`)
 - `MLX_MODEL` - Model name (default: `qwen/qwen3-14b`)
+
+## Proxy Server
+
+The email agent communicates with Gmail through the [api-proxy](https://github.com/brianroberg/api-proxy) server.
+
+### Allowed Operations
+
+- List and retrieve messages
+- List and retrieve labels
+- Modify message labels (add/remove)
+- Trash/untrash messages
+
+### Blocked Operations
+
+The proxy blocks these operations (returns 403):
+- Sending email
+- Creating/modifying/sending drafts
+- Importing/inserting messages
+
+### Error Handling
+
+The proxy returns standard HTTP status codes:
+- `200` - Success
+- `401` - Invalid or missing API key
+- `403` - Operation blocked or confirmation rejected
+- `5xx` - Backend errors
+
+Errors are formatted as `{"error": "type", "message": "description"}`.
