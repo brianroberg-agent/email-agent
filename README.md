@@ -229,19 +229,26 @@ Detected action types:
 
 ### POST /bulk-actions
 
-Apply multiple operations to multiple emails. Always returns 200 with per-email results for easy client handling.
+Apply per-email operations in a single request. Each email can have different operations. Always returns 200 with per-email results for easy client handling.
 
 ```bash
 curl -X POST http://localhost:8081/bulk-actions \
   -H "Content-Type: application/json" \
-  -d '{"email_ids": ["18d5a3b2c4e5f6a7", "18d5a3b2c4e5f6a8"], "operations": ["mark_read", "apply_label:PROCESSED"]}'
+  -d '{
+    "actions": [
+      {"email_id": "18d5a3b2c4e5f6a7", "operations": ["mark_read"]},
+      {"email_id": "18d5a3b2c4e5f6a8", "operations": ["mark_read", "archive"]},
+      {"email_id": "18d5a3b2c4e5f6a9", "operations": ["mark_read", "apply_label:IMPORTANT"]}
+    ]
+  }'
 ```
 
 Request body:
 | Field | Type | Description |
 |-------|------|-------------|
-| `email_ids` | string[] | List of email IDs to act on |
-| `operations` | string[] | Operations to apply (see below) |
+| `actions` | object[] | List of per-email actions |
+| `actions[].email_id` | string | Email ID to act on |
+| `actions[].operations` | string[] | Operations to apply to this email |
 
 Supported operations:
 - `mark_read` - Remove UNREAD label
@@ -254,9 +261,10 @@ Response:
   "success": true,
   "results": [
     {"email_id": "18d5a3b2c4e5f6a7", "success": true, "error": null},
-    {"email_id": "18d5a3b2c4e5f6a8", "success": true, "error": null}
+    {"email_id": "18d5a3b2c4e5f6a8", "success": true, "error": null},
+    {"email_id": "18d5a3b2c4e5f6a9", "success": true, "error": null}
   ],
-  "success_count": 2,
+  "success_count": 3,
   "error_count": 0,
   "error": null
 }

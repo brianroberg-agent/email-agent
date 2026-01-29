@@ -170,12 +170,17 @@ class BulkOperation(str, Enum):
     # apply_label:LABEL_NAME is handled separately
 
 
-class BulkActionsRequest(BaseModel):
-    email_ids: list[str] = Field(..., description="List of email IDs to act on")
+class EmailAction(BaseModel):
+    """A single email with its operations to perform."""
+    email_id: str = Field(..., description="Email ID to act on")
     operations: list[str] = Field(
         ...,
         description="Operations to apply: 'mark_read', 'archive', 'apply_label:LABEL_NAME'"
     )
+
+
+class BulkActionsRequest(BaseModel):
+    actions: list[EmailAction] = Field(..., description="List of per-email actions")
 
 
 class EmailActionResult(BaseModel):
@@ -325,6 +330,8 @@ def apply_single_operation(service, email_id: str, operation: str) -> tuple[bool
             ).execute()
         elif operation.startswith("apply_label:"):
             label_name = operation.split(":", 1)[1]
+            if not label_name:
+                return False, "apply_label requires a label name (e.g., 'apply_label:IMPORTANT')"
             service.users().messages().modify(
                 userId="me",
                 id=email_id,
@@ -572,9 +579,9 @@ async def batch_summarize(request: BatchSummarizeRequest):
 
 @app.post("/bulk-actions", response_model=BulkActionsResponse)
 async def bulk_actions(request: BulkActionsRequest):
-    """Apply multiple operations to multiple emails.
+    """Apply per-email operations in a single request.
 
-    Processes all email/operation combinations and returns per-email results.
+    Each action specifies an email and its operations. Returns per-email results.
     Always returns 200 with success/error counts for easy client handling.
 
     Supported operations:
@@ -588,25 +595,25 @@ async def bulk_actions(request: BulkActionsRequest):
         success_count = 0
         error_count = 0
 
-        for email_id in request.email_ids:
+        for action in request.actions:
             email_errors = []
 
-            for operation in request.operations:
-                success, error = apply_single_operation(service, email_id, operation)
+            for operation in action.operations:
+                success, error = apply_single_operation(service, action.email_id, operation)
                 if not success:
                     email_errors.append(f"{operation}: {error}")
 
             if email_errors:
                 error_count += 1
                 results.append(EmailActionResult(
-                    email_id=email_id,
+                    email_id=action.email_id,
                     success=False,
                     error="; ".join(email_errors),
                 ))
             else:
                 success_count += 1
                 results.append(EmailActionResult(
-                    email_id=email_id,
+                    email_id=action.email_id,
                     success=True,
                 ))
 

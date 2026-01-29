@@ -857,7 +857,7 @@ class TestBatchSummarizeEndpoint:
 
 
 class TestBulkActionsEndpoint:
-    """Tests for the /bulk-actions endpoint."""
+    """Tests for the /bulk-actions endpoint with per-email actions format."""
 
     @patch("email_server.get_gmail_service_with_modify")
     def test_bulk_actions_mark_read(self, mock_get_service, client):
@@ -865,8 +865,10 @@ class TestBulkActionsEndpoint:
         mock_get_service.return_value = mock_service
 
         response = client.post("/bulk-actions", json={
-            "email_ids": ["msg123", "msg456"],
-            "operations": ["mark_read"]
+            "actions": [
+                {"email_id": "msg123", "operations": ["mark_read"]},
+                {"email_id": "msg456", "operations": ["mark_read"]},
+            ]
         })
         assert response.status_code == 200
 
@@ -883,8 +885,9 @@ class TestBulkActionsEndpoint:
         mock_get_service.return_value = mock_service
 
         response = client.post("/bulk-actions", json={
-            "email_ids": ["msg123"],
-            "operations": ["archive"]
+            "actions": [
+                {"email_id": "msg123", "operations": ["archive"]}
+            ]
         })
         data = response.json()
 
@@ -898,8 +901,9 @@ class TestBulkActionsEndpoint:
         mock_get_service.return_value = mock_service
 
         response = client.post("/bulk-actions", json={
-            "email_ids": ["msg123"],
-            "operations": ["apply_label:IMPORTANT"]
+            "actions": [
+                {"email_id": "msg123", "operations": ["apply_label:IMPORTANT"]}
+            ]
         })
         data = response.json()
 
@@ -908,13 +912,14 @@ class TestBulkActionsEndpoint:
         assert call_kwargs["body"] == {"addLabelIds": ["IMPORTANT"]}
 
     @patch("email_server.get_gmail_service_with_modify")
-    def test_bulk_actions_multiple_operations(self, mock_get_service, client):
+    def test_bulk_actions_multiple_operations_per_email(self, mock_get_service, client):
         mock_service = Mock()
         mock_get_service.return_value = mock_service
 
         response = client.post("/bulk-actions", json={
-            "email_ids": ["msg123"],
-            "operations": ["mark_read", "archive", "apply_label:PROCESSED"]
+            "actions": [
+                {"email_id": "msg123", "operations": ["mark_read", "archive", "apply_label:PROCESSED"]}
+            ]
         })
         data = response.json()
 
@@ -924,14 +929,33 @@ class TestBulkActionsEndpoint:
         assert mock_service.users.return_value.messages.return_value.modify.call_count == 3
 
     @patch("email_server.get_gmail_service_with_modify")
+    def test_bulk_actions_different_operations_per_email(self, mock_get_service, client):
+        """Test that each email can have different operations."""
+        mock_service = Mock()
+        mock_get_service.return_value = mock_service
+
+        response = client.post("/bulk-actions", json={
+            "actions": [
+                {"email_id": "msg1", "operations": ["mark_read"]},
+                {"email_id": "msg2", "operations": ["mark_read", "archive"]},
+                {"email_id": "msg3", "operations": ["mark_read", "apply_label:IMPORTANT"]},
+            ]
+        })
+        data = response.json()
+
+        assert data["success"] is True
+        assert data["success_count"] == 3
+        assert data["error_count"] == 0
+        # 1 + 2 + 2 = 5 total operations
+        assert mock_service.users.return_value.messages.return_value.modify.call_count == 5
+
+    @patch("email_server.get_gmail_service_with_modify")
     def test_bulk_actions_partial_failure(self, mock_get_service, client):
         mock_service = Mock()
         mock_get_service.return_value = mock_service
 
         # First email succeeds, second fails
-        call_count = [0]
         def modify_side_effect(userId, id, body):
-            call_count[0] += 1
             mock_result = Mock()
             if id == "msg_fail":
                 mock_result.execute.side_effect = Exception("Permission denied")
@@ -942,8 +966,10 @@ class TestBulkActionsEndpoint:
         mock_service.users.return_value.messages.return_value.modify.side_effect = modify_side_effect
 
         response = client.post("/bulk-actions", json={
-            "email_ids": ["msg_ok", "msg_fail"],
-            "operations": ["mark_read"]
+            "actions": [
+                {"email_id": "msg_ok", "operations": ["mark_read"]},
+                {"email_id": "msg_fail", "operations": ["mark_read"]},
+            ]
         })
         data = response.json()
 
@@ -960,8 +986,9 @@ class TestBulkActionsEndpoint:
         mock_get_service.return_value = mock_service
 
         response = client.post("/bulk-actions", json={
-            "email_ids": ["msg123"],
-            "operations": ["unknown_op"]
+            "actions": [
+                {"email_id": "msg123", "operations": ["unknown_op"]}
+            ]
         })
         data = response.json()
 
@@ -970,41 +997,86 @@ class TestBulkActionsEndpoint:
         assert "Unknown operation" in data["results"][0]["error"]
 
     @patch("email_server.get_gmail_service_with_modify")
+    def test_bulk_actions_apply_label_empty_name(self, mock_get_service, client):
+        """apply_label: with empty label name should return an error."""
+        mock_service = Mock()
+        mock_get_service.return_value = mock_service
+
+        response = client.post("/bulk-actions", json={
+            "actions": [
+                {"email_id": "msg123", "operations": ["apply_label:"]}
+            ]
+        })
+        data = response.json()
+
+        assert data["success"] is True
+        assert data["error_count"] == 1
+        assert "apply_label requires a label name" in data["results"][0]["error"]
+        # No Gmail API calls should be made
+        mock_service.users.return_value.messages.return_value.modify.assert_not_called()
+
+    @patch("email_server.get_gmail_service_with_modify")
     def test_bulk_actions_handles_service_error(self, mock_get_service, client):
         mock_get_service.side_effect = Exception("Gmail service unavailable")
 
         response = client.post("/bulk-actions", json={
-            "email_ids": ["msg123"],
-            "operations": ["mark_read"]
+            "actions": [
+                {"email_id": "msg123", "operations": ["mark_read"]}
+            ]
         })
         data = response.json()
 
         assert data["success"] is False
         assert "Gmail service unavailable" in data["error"]
 
-    def test_bulk_actions_requires_email_ids(self, client):
-        response = client.post("/bulk-actions", json={"operations": ["mark_read"]})
+    def test_bulk_actions_requires_actions(self, client):
+        response = client.post("/bulk-actions", json={})
         assert response.status_code == 422
 
-    def test_bulk_actions_requires_operations(self, client):
-        response = client.post("/bulk-actions", json={"email_ids": ["msg123"]})
+    def test_bulk_actions_action_requires_email_id(self, client):
+        response = client.post("/bulk-actions", json={
+            "actions": [{"operations": ["mark_read"]}]
+        })
+        assert response.status_code == 422
+
+    def test_bulk_actions_action_requires_operations(self, client):
+        response = client.post("/bulk-actions", json={
+            "actions": [{"email_id": "msg123"}]
+        })
         assert response.status_code == 422
 
     @patch("email_server.get_gmail_service_with_modify")
-    def test_bulk_actions_empty_lists(self, mock_get_service, client):
+    def test_bulk_actions_empty_actions_list(self, mock_get_service, client):
         mock_service = Mock()
         mock_get_service.return_value = mock_service
 
-        response = client.post("/bulk-actions", json={
-            "email_ids": [],
-            "operations": ["mark_read"]
-        })
+        response = client.post("/bulk-actions", json={"actions": []})
         data = response.json()
 
         assert data["success"] is True
         assert data["success_count"] == 0
         assert data["error_count"] == 0
         assert data["results"] == []
+
+    @patch("email_server.get_gmail_service_with_modify")
+    def test_bulk_actions_empty_operations_for_email(self, mock_get_service, client):
+        """Empty operations array for an email should succeed with no ops performed."""
+        mock_service = Mock()
+        mock_get_service.return_value = mock_service
+
+        response = client.post("/bulk-actions", json={
+            "actions": [
+                {"email_id": "msg123", "operations": []}
+            ]
+        })
+        data = response.json()
+
+        assert data["success"] is True
+        assert data["success_count"] == 1
+        assert data["error_count"] == 0
+        assert data["results"][0]["success"] is True
+        # No Gmail API calls should be made
+        mock_service.users.return_value.messages.return_value.modify.assert_not_called()
 
 
 class TestSearchEndpointNewFields:
