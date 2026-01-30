@@ -1,39 +1,10 @@
 """Gmail utility functions for email server v2.
 
-These functions handle Gmail API authentication and message parsing.
-They have no framework dependencies.
+These functions handle parsing of Gmail API message data.
+They have no framework or authentication dependencies.
 """
 
 import base64
-from google.oauth2.credentials import Credentials
-from google.auth.transport.requests import Request
-from googleapiclient.discovery import build
-
-
-def get_gmail_service():
-    """Creates authenticated Gmail read-only service."""
-    creds = Credentials.from_authorized_user_file(
-        "token.json",
-        scopes=["https://www.googleapis.com/auth/gmail.readonly"],
-    )
-    if creds.expired and creds.refresh_token:
-        creds.refresh(Request())
-        with open("token.json", "w") as token_file:
-            token_file.write(creds.to_json())
-    return build("gmail", "v1", credentials=creds)
-
-
-def get_gmail_service_with_modify():
-    """Creates authenticated Gmail service with modify scope."""
-    creds = Credentials.from_authorized_user_file(
-        "token.json",
-        scopes=["https://www.googleapis.com/auth/gmail.modify"],
-    )
-    if creds.expired and creds.refresh_token:
-        creds.refresh(Request())
-        with open("token.json", "w") as token_file:
-            token_file.write(creds.to_json())
-    return build("gmail", "v1", credentials=creds)
 
 
 def get_header(headers: list, name: str) -> str:

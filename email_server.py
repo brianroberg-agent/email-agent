@@ -1,9 +1,12 @@
-"""Email Agent Server v2 - FastAPI wrapper around Gmail API.
+"""Email Agent Server v2 - FastAPI wrapper around Gmail API via proxy.
 
 This server provides structured endpoints for email operations.
 The calling agent (Claude) handles all orchestration decisions.
 Email bodies never leave this local server - only metadata and
 LLM-generated summaries are returned.
+
+All Gmail API operations go through a proxy server that handles
+Google OAuth authentication and human-in-the-loop controls.
 """
 
 import json
@@ -16,11 +19,12 @@ import httpx
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 
-from gmail_utils import (
-    get_gmail_service,
-    get_gmail_service_with_modify,
-    get_header,
-    decode_body,
+from gmail_utils import get_header, decode_body
+from proxy_client import (
+    get_gmail_client,
+    ProxyAuthError,
+    ProxyForbiddenError,
+    ProxyError,
 )
 
 app = FastAPI(title="Email Agent Server v2", version="2.0")
@@ -130,6 +134,20 @@ class ActionResponse(BaseModel):
 class HealthResponse(BaseModel):
     status: str
     version: str
+
+
+class LabelInfo(BaseModel):
+    id: str
+    name: str
+    type: str
+    messages_total: Optional[int] = None
+    messages_unread: Optional[int] = None
+
+
+class LabelsResponse(BaseModel):
+    success: bool
+    labels: list[LabelInfo]
+    error: Optional[str] = None
 
 
 class DetectedAction(str, Enum):
@@ -304,11 +322,57 @@ def has_attachments(payload: dict) -> bool:
     return False
 
 
-def apply_single_operation(service, email_id: str, operation: str) -> tuple[bool, str]:
+def format_proxy_error(e: Exception) -> str:
+    """Format a proxy error for user-friendly display."""
+    if isinstance(e, ProxyAuthError):
+        return f"Authentication error: {e}"
+    if isinstance(e, ProxyForbiddenError):
+        return f"Operation blocked: {e}"
+    if isinstance(e, ProxyError):
+        return f"Proxy error: {e}"
+    return str(e)
+
+
+async def resolve_label_id(client, label_name: str) -> str:
+    """Resolve a label name to its Gmail label ID.
+
+    Gmail API requires label IDs for modify operations. System labels (STARRED,
+    INBOX, etc.) have IDs matching their names, but user-created labels have
+    IDs like 'Label_123456789'.
+
+    Args:
+        client: GmailProxyClient instance
+        label_name: The label name to resolve (e.g., 'response-required' or 'STARRED')
+
+    Returns:
+        The label ID to use with Gmail API.
+
+    Raises:
+        ValueError: If the label name is not found.
+    """
+    # System labels have IDs matching their names - check common ones first
+    system_labels = {
+        "INBOX", "STARRED", "IMPORTANT", "SENT", "DRAFT", "SPAM", "TRASH",
+        "UNREAD", "CATEGORY_PERSONAL", "CATEGORY_SOCIAL", "CATEGORY_PROMOTIONS",
+        "CATEGORY_UPDATES", "CATEGORY_FORUMS",
+    }
+    if label_name.upper() in system_labels:
+        return label_name.upper()
+
+    # For user labels, look up the ID from the labels list
+    result = await client.list_labels()
+    for label in result.get("labels", []):
+        if label.get("name") == label_name:
+            return label.get("id")
+
+    raise ValueError(f"Label '{label_name}' not found")
+
+
+async def apply_single_operation(client, email_id: str, operation: str) -> tuple[bool, str]:
     """Apply one operation to an email.
 
     Args:
-        service: Gmail API service with modify permissions
+        client: GmailProxyClient instance
         email_id: The email ID to operate on
         operation: One of 'mark_read', 'archive', or 'apply_label:LABEL_NAME'
 
@@ -317,37 +381,55 @@ def apply_single_operation(service, email_id: str, operation: str) -> tuple[bool
     """
     try:
         if operation == "mark_read":
-            service.users().messages().modify(
-                userId="me",
-                id=email_id,
-                body={"removeLabelIds": ["UNREAD"]},
-            ).execute()
+            await client.modify_message(email_id, remove_label_ids=["UNREAD"])
         elif operation == "archive":
-            service.users().messages().modify(
-                userId="me",
-                id=email_id,
-                body={"removeLabelIds": ["INBOX"]},
-            ).execute()
+            await client.modify_message(email_id, remove_label_ids=["INBOX"])
         elif operation.startswith("apply_label:"):
             label_name = operation.split(":", 1)[1]
             if not label_name:
                 return False, "apply_label requires a label name (e.g., 'apply_label:IMPORTANT')"
-            service.users().messages().modify(
-                userId="me",
-                id=email_id,
-                body={"addLabelIds": [label_name]},
-            ).execute()
+            label_id = await resolve_label_id(client, label_name)
+            await client.modify_message(email_id, add_label_ids=[label_id])
         else:
             return False, f"Unknown operation: {operation}"
         return True, ""
-    except Exception as e:
+    except ValueError as e:
         return False, str(e)
+    except Exception as e:
+        return False, format_proxy_error(e)
 
 
 @app.get("/health", response_model=HealthResponse)
 async def health():
     """Health check endpoint. No Gmail or LLM dependency."""
     return HealthResponse(status="ok", version="2.0")
+
+
+@app.get("/labels", response_model=LabelsResponse)
+async def labels():
+    """List all available Gmail labels.
+
+    Returns both system labels (INBOX, STARRED, etc.) and user-created labels
+    with message counts.
+    """
+    try:
+        client = get_gmail_client()
+        result = await client.list_labels()
+
+        label_list = []
+        for label in result.get("labels", []):
+            label_list.append(LabelInfo(
+                id=label.get("id", ""),
+                name=label.get("name", ""),
+                type=label.get("type", "user"),
+                messages_total=label.get("messagesTotal"),
+                messages_unread=label.get("messagesUnread"),
+            ))
+
+        return LabelsResponse(success=True, labels=label_list)
+
+    except Exception as e:
+        return LabelsResponse(success=False, labels=[], error=format_proxy_error(e))
 
 
 @app.post("/search", response_model=SearchResponse)
@@ -358,31 +440,22 @@ async def search(request: SearchRequest):
     message metadata including snippets (~100 chars) for context.
     """
     try:
-        service = get_gmail_service()
+        client = get_gmail_client()
         query_string = build_gmail_query(request)
 
-        # Build list parameters
-        list_params = {
-            "userId": "me",
-            "maxResults": request.limit,
-        }
-        if query_string:
-            list_params["q"] = query_string
-        if request.folder:
-            list_params["labelIds"] = [request.folder]
-
-        # Get message IDs
-        result = service.users().messages().list(**list_params).execute()
+        # List messages
+        label_ids = [request.folder] if request.folder else None
+        result = await client.list_messages(
+            max_results=request.limit,
+            q=query_string if query_string else None,
+            label_ids=label_ids,
+        )
         message_ids = result.get("messages", [])
 
         # Fetch full message for each (needed for attachment detection)
         messages = []
         for msg_info in message_ids:
-            msg = service.users().messages().get(
-                userId="me",
-                id=msg_info["id"],
-                format="full",
-            ).execute()
+            msg = await client.get_message(msg_info["id"], format="full")
 
             payload = msg.get("payload", {})
             headers = payload.get("headers", [])
@@ -401,7 +474,7 @@ async def search(request: SearchRequest):
         return SearchResponse(success=True, messages=messages, error=None)
 
     except Exception as e:
-        return SearchResponse(success=False, messages=[], error=str(e))
+        return SearchResponse(success=False, messages=[], error=format_proxy_error(e))
 
 
 @app.post("/summarize", response_model=LLMResponse)
@@ -412,12 +485,8 @@ async def summarize(request: SummarizeRequest):
     The raw email body is never returned - only the summary.
     """
     try:
-        service = get_gmail_service()
-        msg = service.users().messages().get(
-            userId="me",
-            id=request.message_id,
-            format="full",
-        ).execute()
+        client = get_gmail_client()
+        msg = await client.get_message(request.message_id, format="full")
 
         body = decode_body(msg.get("payload", {}))
         # Truncate body if needed
@@ -428,7 +497,7 @@ async def summarize(request: SummarizeRequest):
         return LLMResponse(success=True, answer=summary, error=None)
 
     except Exception as e:
-        return LLMResponse(success=False, answer="", error=str(e))
+        return LLMResponse(success=False, answer="", error=format_proxy_error(e))
 
 
 @app.post("/ask-about", response_model=LLMResponse)
@@ -439,12 +508,8 @@ async def ask_about(request: AskAboutRequest):
     based only on the email content.
     """
     try:
-        service = get_gmail_service()
-        msg = service.users().messages().get(
-            userId="me",
-            id=request.message_id,
-            format="full",
-        ).execute()
+        client = get_gmail_client()
+        msg = await client.get_message(request.message_id, format="full")
 
         body = decode_body(msg.get("payload", {}))
         # Truncate body if needed
@@ -456,55 +521,46 @@ async def ask_about(request: AskAboutRequest):
         return LLMResponse(success=True, answer=answer, error=None)
 
     except Exception as e:
-        return LLMResponse(success=False, answer="", error=str(e))
+        return LLMResponse(success=False, answer="", error=format_proxy_error(e))
 
 
 @app.post("/mark-read", response_model=ActionResponse)
 async def mark_read(request: EmailIdRequest):
     """Mark an email as read by removing the UNREAD label."""
     try:
-        service = get_gmail_service_with_modify()
-        service.users().messages().modify(
-            userId="me",
-            id=request.email_id,
-            body={"removeLabelIds": ["UNREAD"]},
-        ).execute()
+        client = get_gmail_client()
+        await client.modify_message(request.email_id, remove_label_ids=["UNREAD"])
         return ActionResponse(success=True, message="Email marked as read")
 
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail=format_proxy_error(e))
 
 
 @app.post("/apply-label", response_model=ActionResponse)
 async def apply_label(request: ApplyLabelRequest):
     """Apply a label to an email."""
     try:
-        service = get_gmail_service_with_modify()
-        service.users().messages().modify(
-            userId="me",
-            id=request.email_id,
-            body={"addLabelIds": [request.label_name]},
-        ).execute()
+        client = get_gmail_client()
+        label_id = await resolve_label_id(client, request.label_name)
+        await client.modify_message(request.email_id, add_label_ids=[label_id])
         return ActionResponse(success=True, message=f"Label '{request.label_name}' applied")
 
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail=format_proxy_error(e))
 
 
 @app.post("/archive", response_model=ActionResponse)
 async def archive(request: EmailIdRequest):
     """Archive an email by removing it from the inbox."""
     try:
-        service = get_gmail_service_with_modify()
-        service.users().messages().modify(
-            userId="me",
-            id=request.email_id,
-            body={"removeLabelIds": ["INBOX"]},
-        ).execute()
+        client = get_gmail_client()
+        await client.modify_message(request.email_id, remove_label_ids=["INBOX"])
         return ActionResponse(success=True, message="Email archived")
 
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail=format_proxy_error(e))
 
 
 @app.post("/batch-summarize", response_model=BatchSummarizeResponse)
@@ -515,16 +571,12 @@ async def batch_summarize(request: BatchSummarizeRequest):
     summary, detected action type, and any detected deadlines.
     """
     try:
-        service = get_gmail_service()
+        client = get_gmail_client()
         results = []
 
         for message_id in request.message_ids:
             try:
-                msg = service.users().messages().get(
-                    userId="me",
-                    id=message_id,
-                    format="full",
-                ).execute()
+                msg = await client.get_message(message_id, format="full")
 
                 body = decode_body(msg.get("payload", {}))
                 if len(body) > MAX_BODY_LENGTH:
@@ -568,13 +620,13 @@ async def batch_summarize(request: BatchSummarizeRequest):
                 results.append(EmailSummaryResult(
                     message_id=message_id,
                     success=False,
-                    error=str(e),
+                    error=format_proxy_error(e),
                 ))
 
         return BatchSummarizeResponse(success=True, results=results)
 
     except Exception as e:
-        return BatchSummarizeResponse(success=False, results=[], error=str(e))
+        return BatchSummarizeResponse(success=False, results=[], error=format_proxy_error(e))
 
 
 @app.post("/bulk-actions", response_model=BulkActionsResponse)
@@ -590,7 +642,7 @@ async def bulk_actions(request: BulkActionsRequest):
     - apply_label:LABEL_NAME: Add the specified label
     """
     try:
-        service = get_gmail_service_with_modify()
+        client = get_gmail_client()
         results = []
         success_count = 0
         error_count = 0
@@ -599,7 +651,7 @@ async def bulk_actions(request: BulkActionsRequest):
             email_errors = []
 
             for operation in action.operations:
-                success, error = apply_single_operation(service, action.email_id, operation)
+                success, error = await apply_single_operation(client, action.email_id, operation)
                 if not success:
                     email_errors.append(f"{operation}: {error}")
 
@@ -630,5 +682,5 @@ async def bulk_actions(request: BulkActionsRequest):
             results=[],
             success_count=0,
             error_count=0,
-            error=str(e),
+            error=format_proxy_error(e),
         )
