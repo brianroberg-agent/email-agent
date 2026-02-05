@@ -591,29 +591,47 @@ The Gmail API uses a specific service account to publish. Add it as a publisher:
 
 Tell Gmail to send notifications to your Pub/Sub topic.
 
-**4.1 Get your topic name:**
+> **Note:** The Gmail API Explorer won't work for this step because it uses Google's own OAuth credentials, which can only publish to Google's Pub/Sub topics. You must use your own OAuth credentials via `gcloud` CLI.
 
+**4.1 Create OAuth credentials in your project:**
+
+1. Go to [Google Cloud Console > APIs & Services > Credentials](https://console.cloud.google.com/apis/credentials)
+2. Click "Create Credentials" > "OAuth client ID"
+3. Application type: "Web application"
+4. Name: "Gmail Watch Setup" (or any name)
+5. Under "Authorized redirect URIs", add: `https://developers.google.com/oauthplayground`
+6. Click "Create" and note your **Client ID** and **Client Secret**
+
+**4.2 Get an access token using OAuth 2.0 Playground:**
+
+1. Go to [OAuth 2.0 Playground](https://developers.google.com/oauthplayground/)
+2. Click the **gear icon** (⚙️) in the top right
+3. Check "Use your own OAuth credentials"
+4. Enter your Client ID and Client Secret from step 4.1
+5. Close the settings
+6. In the left panel, find "Gmail API v1" and select:
+   - `https://www.googleapis.com/auth/gmail.readonly`
+   - `https://www.googleapis.com/auth/gmail.modify`
+7. Click "Authorize APIs" and sign in with your Gmail account
+8. Grant **both** permissions when prompted
+9. Click "Exchange authorization code for tokens"
+10. Copy the **Access token** from the response
+
+**4.3 Call the Gmail watch API:**
+
+```bash
+curl -X POST "https://gmail.googleapis.com/gmail/v1/users/me/watch" \
+  -H "Authorization: Bearer YOUR_ACCESS_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "topicName": "projects/YOUR-PROJECT-ID/topics/gmail-notifications",
+    "labelIds": ["INBOX"]
+  }'
 ```
-projects/YOUR-PROJECT-ID/topics/gmail-notifications
-```
 
-**4.2 Call the Gmail watch API:**
+Replace `YOUR_ACCESS_TOKEN` with the token from step 4.2, and `YOUR-PROJECT-ID` with your Google Cloud project ID.
 
-Using the [Gmail API Explorer](https://developers.google.com/gmail/api/reference/rest/v1/users/watch):
-
-1. Go to the link above
-2. Click "Try it"
-3. Set `userId` to `me`
-4. In Request body:
-   ```json
-   {
-     "topicName": "projects/YOUR-PROJECT-ID/topics/gmail-notifications",
-     "labelIds": ["INBOX"]
-   }
-   ```
-5. Click "Execute" and authorize with your Gmail account
-
-**Response:**
+**Expected response:**
 ```json
 {
   "historyId": "1234567",
@@ -621,7 +639,7 @@ Using the [Gmail API Explorer](https://developers.google.com/gmail/api/reference
 }
 ```
 
-> **Important:** Gmail watch expires after 7 days. You'll need to renew it periodically.
+> **Important:** Gmail watch expires after 7 days. You'll need to renew it by running the curl command again.
 
 ---
 
