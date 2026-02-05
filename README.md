@@ -5,15 +5,17 @@ A privacy-focused FastAPI server that wraps the Gmail API for use with AI agents
 ## Architecture
 
 ```
-Claude Code (cloud, orchestrator)
-    │
-    │  structured HTTP endpoints (JSON)
-    ▼
+Gmail Pub-Sub ─────────────────────────────────┐
+                                               │
+Claude Code (cloud, orchestrator)              │
+    │                                          │
+    │  structured HTTP endpoints (JSON)        │
+    ▼                                          ▼
 email_server.py (local FastAPI server, port 8081)
-    │                        │
-    │ Proxy API (API key)    │ Local LLM (MLX, port 8080)
-    ▼                        ▼
-api-proxy (handles OAuth)   Qwen3-14B (summarize/ask-about only)
+    │                        │                 │
+    │ Proxy API (API key)    │ Local LLM       │ Cloud LLM (person detection)
+    ▼                        ▼                 ▼
+api-proxy (handles OAuth)   Qwen3-14B      novita.ai/OpenAI (metadata only)
     │
     │ Gmail API (OAuth)
     ▼
@@ -21,6 +23,8 @@ Gmail
 ```
 
 **Privacy guarantee**: Email bodies are processed locally and never sent to cloud services. The calling agent only sees message IDs, dates, sender addresses, subject lines, snippets (~100 chars), labels, and LLM-generated summaries.
+
+**Person detection**: When using Gmail Pub-Sub for automatic classification, only email metadata (sender, subject, snippet) is sent to the cloud LLM for person detection. Body text from emails identified as personal never leaves the local machine.
 
 **Human-in-the-loop**: The proxy server handles all confirmation flows for write operations. Dangerous operations (sending email, drafts) are blocked at the proxy level.
 
@@ -55,6 +59,12 @@ No separate install step needed. The `uv run` command automatically manages depe
 | `PROXY_URL` | No | `http://host.docker.internal:8000` | URL of the proxy server |
 | `MLX_URL` | No | `http://localhost:8080/v1/chat/completions` | Local LLM endpoint |
 | `MLX_MODEL` | No | `qwen/qwen3-14b` | Model name for LLM requests |
+| `CLOUD_LLM_URL` | No | `https://api.novita.ai/v3/openai` | Cloud LLM endpoint (OpenAI-compatible) |
+| `CLOUD_LLM_API_KEY` | No | - | API key for cloud LLM (required for Pub-Sub classification) |
+| `CLOUD_LLM_MODEL` | No | `minimax/minimax-m2.1` | Cloud model for person detection |
+| `SENDER_WHITELIST` | No | - | Comma-separated emails/domains always routed to local MLX |
+| `QUEUE_DB_PATH` | No | `/app/data/classification.db` | SQLite database path for classification queue |
+| `QUEUE_RETENTION_DAYS` | No | `7` | Days to retain processed queue entries |
 
 ## Usage
 
@@ -328,6 +338,117 @@ Response:
   "success_count": 3,
   "error_count": 0,
   "error": null
+}
+```
+
+## Automatic Classification (Gmail Pub-Sub)
+
+The email agent can automatically classify incoming emails using Gmail Pub-Sub notifications. This feature routes emails based on whether they're from real people:
+
+- **Personal emails** → Queued for local MLX classification (body never leaves local machine)
+- **Non-personal emails** → Classified by cloud LLM (body is sent to cloud)
+
+### POST /pubsub/webhook
+
+Receives Gmail Pub-Sub push notifications. Configure Google Cloud Pub-Sub to push to this endpoint.
+
+```bash
+# Gmail Pub-Sub sends notifications like:
+curl -X POST http://localhost:8081/pubsub/webhook \
+  -H "Content-Type: application/json" \
+  -d '{
+    "message": {
+      "data": "eyJlbWFpbEFkZHJlc3MiOiJ1c2VyQGV4YW1wbGUuY29tIiwiaGlzdG9yeUlkIjoiMTIzNDU2In0=",
+      "messageId": "123",
+      "publishTime": "2026-02-05T10:00:00Z"
+    },
+    "subscription": "projects/myproject/subscriptions/gmail"
+  }'
+```
+
+Response:
+```json
+{
+  "success": true,
+  "message_id": "123456",
+  "action": "processing",
+  "classification": {"queued_messages": 3}
+}
+```
+
+### POST /classify/{message_id}
+
+Manually trigger classification for a specific email. Useful for testing or reprocessing.
+
+```bash
+curl -X POST http://localhost:8081/classify/18d5a3b2c4e5f6a7
+```
+
+Response:
+```json
+{
+  "success": true,
+  "message_id": "18d5a3b2c4e5f6a7",
+  "action": "queued_for_mlx",
+  "is_person": true,
+  "classification": null
+}
+```
+
+Actions:
+- `queued_for_mlx` - Email is from a person, queued for local processing
+- `classified_cloud` - Email is non-personal, classified by cloud LLM
+- `skipped` - Email already in queue
+
+### GET /queue/status
+
+Get classification queue statistics.
+
+```bash
+curl http://localhost:8081/queue/status
+```
+
+Response:
+```json
+{
+  "pending": 5,
+  "processed": 142,
+  "failed": 2,
+  "oldest_pending": "2026-02-05T09:30:00"
+}
+```
+
+### GET /config/whitelist
+
+Get the current sender whitelist.
+
+```bash
+curl http://localhost:8081/config/whitelist
+```
+
+Response:
+```json
+{
+  "whitelist": ["mom@gmail.com", "@family.com"]
+}
+```
+
+### POST /config/whitelist
+
+Add a sender to the whitelist (session only - use `SENDER_WHITELIST` env var for persistence).
+
+```bash
+curl -X POST http://localhost:8081/config/whitelist \
+  -H "Content-Type: application/json" \
+  -d '{"sender_pattern": "@important-domain.com"}'
+```
+
+Response:
+```json
+{
+  "success": true,
+  "message": "Added '@important-domain.com' to whitelist",
+  "whitelist": ["mom@gmail.com", "@family.com", "@important-domain.com"]
 }
 ```
 
