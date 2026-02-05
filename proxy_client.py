@@ -251,6 +251,35 @@ class GmailProxyClient:
             response = await client.get(url, headers=self._get_headers())
             return self._handle_response(response)
 
+    async def list_history(
+        self,
+        start_history_id: str,
+        user_id: str = "me",
+        label_id: Optional[str] = None,
+        history_types: Optional[list[str]] = None,
+    ) -> dict:
+        """List history of changes to the mailbox.
+
+        Args:
+            start_history_id: History ID to start from.
+            user_id: The user's email address or 'me' for authenticated user.
+            label_id: Only return history for this label.
+            history_types: Filter by history types (e.g., ['messageAdded']).
+
+        Returns:
+            Dict with 'history' key containing list of history records.
+        """
+        url = f"{self.proxy_url}/gmail/v1/users/{user_id}/history"
+        params = {"startHistoryId": start_history_id}
+        if label_id:
+            params["labelId"] = label_id
+        if history_types:
+            params["historyTypes"] = ",".join(history_types)
+
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            response = await client.get(url, headers=self._get_headers(), params=params)
+            return self._handle_response(response)
+
 
 # Singleton instance for convenience
 _client: Optional[GmailProxyClient] = None

@@ -14,6 +14,9 @@ RUN uv sync --frozen --no-dev
 # Copy application code
 COPY *.py ./
 
+# Create data directory for SQLite database
+RUN mkdir -p /app/data && chmod 777 /app/data
+
 EXPOSE 8081
 
 CMD ["uv", "run", "uvicorn", "email_server:app", "--host", "0.0.0.0", "--port", "8081"]

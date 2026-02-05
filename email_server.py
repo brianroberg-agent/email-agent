@@ -7,16 +7,25 @@ LLM-generated summaries are returned.
 
 All Gmail API operations go through a proxy server that handles
 Google OAuth authentication and human-in-the-loop controls.
+
+v2.1: Added Gmail Pub-Sub webhook for automatic classification
+with privacy-preserving routing (personal emails stay local).
 """
 
+import asyncio
+import base64
 import json
+import logging
 import os
 import re
+import sqlite3
+import time
+from contextlib import asynccontextmanager
 from enum import Enum
 from typing import Optional
 
 import httpx
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, BackgroundTasks
 from pydantic import BaseModel, Field
 
 from gmail_utils import get_header, decode_body
@@ -26,8 +35,43 @@ from proxy_client import (
     ProxyForbiddenError,
     ProxyError,
 )
+from config import get_config
+from cloud_llm import get_cloud_llm_client
+from classification_queue import get_queue
 
-app = FastAPI(title="Email Agent Server v2", version="2.0")
+logger = logging.getLogger(__name__)
+
+
+# Background worker task handle
+_worker_task: Optional[asyncio.Task] = None
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Manage application lifecycle - start/stop background worker."""
+    global _worker_task
+
+    # Startup: initialize queue and start worker
+    config = get_config()
+    queue = await get_queue(config.queue_db_path)
+    logger.info(f"Classification queue initialized at {config.queue_db_path}")
+
+    _worker_task = asyncio.create_task(classification_worker())
+    logger.info("Classification worker started")
+
+    yield
+
+    # Shutdown: stop worker
+    if _worker_task:
+        _worker_task.cancel()
+        try:
+            await _worker_task
+        except asyncio.CancelledError:
+            pass
+        logger.info("Classification worker stopped")
+
+
+app = FastAPI(title="Email Agent Server v2", version="2.1", lifespan=lifespan)
 
 # LLM configuration
 MLX_URL = os.environ.get("MLX_URL", "http://localhost:8080/v1/chat/completions")
@@ -215,6 +259,39 @@ class BulkActionsResponse(BaseModel):
     error: Optional[str] = None
 
 
+# Pub-Sub and Classification models
+class PubSubNotification(BaseModel):
+    """Gmail Pub-Sub push notification payload."""
+    message: dict = Field(..., description="Pub-Sub message with base64 data")
+    subscription: str = Field(..., description="Subscription name")
+
+
+class ClassificationResponse(BaseModel):
+    """Response from classification endpoint."""
+    success: bool
+    message_id: str
+    action: str = Field(..., description="'queued_for_mlx' or 'classified_cloud'")
+    is_person: Optional[bool] = None
+    classification: Optional[dict] = None
+    error: Optional[str] = None
+
+
+class QueueStatusResponse(BaseModel):
+    """Classification queue status."""
+    pending: int
+    processed: int
+    failed: int
+    oldest_pending: Optional[str] = None
+
+
+class WhitelistRequest(BaseModel):
+    """Add sender to whitelist."""
+    sender_pattern: str = Field(
+        ...,
+        description="Email or domain pattern (e.g., 'user@example.com' or '@example.com')"
+    )
+
+
 async def call_local_llm(system_prompt: str, user_content: str) -> str:
     """Call the local LLM (Qwen3-14B via MLX) for summarization or Q&A.
 
@@ -242,6 +319,54 @@ async def call_local_llm(system_prompt: str, user_content: str) -> str:
         data = response.json()
         text = data["choices"][0]["message"]["content"]
         return THINKING_PATTERN.sub("", text).strip()
+
+
+async def fetch_email_body(message_id: str, max_length: int = MAX_BODY_LENGTH) -> str:
+    """Fetch and decode email body, truncating if necessary.
+
+    Args:
+        message_id: Gmail message ID.
+        max_length: Maximum body length (default: MAX_BODY_LENGTH).
+
+    Returns:
+        Decoded and potentially truncated email body.
+    """
+    client = get_gmail_client()
+    msg = await client.get_message(message_id, format="full")
+    body = decode_body(msg.get("payload", {}))
+    if len(body) > max_length:
+        body = body[:max_length] + "..."
+    return body
+
+
+def extract_sender_email(from_addr: str) -> str:
+    """Extract email address from 'Name <email>' format.
+
+    Args:
+        from_addr: Full From header value.
+
+    Returns:
+        Just the email address portion.
+    """
+    if not from_addr:
+        return ""
+    match = re.search(r'<([^>]+)>', from_addr)
+    return match.group(1) if match else from_addr
+
+
+async def apply_classification_label(message_id: str, label_name: str) -> None:
+    """Apply a classification label to an email, logging failures.
+
+    Args:
+        message_id: Gmail message ID.
+        label_name: Label name to apply (e.g., 'agent/cloud').
+    """
+    try:
+        client = get_gmail_client()
+        label_id = await resolve_label_id(client, label_name)
+        await client.modify_message(message_id, add_label_ids=[label_id])
+    except Exception as e:
+        logger.warning(f"Failed to apply {label_name} label to {message_id}: {e}")
 
 
 def build_gmail_query(request: SearchRequest) -> str:
@@ -684,3 +809,314 @@ async def bulk_actions(request: BulkActionsRequest):
             error_count=0,
             error=format_proxy_error(e),
         )
+
+
+# =============================================================================
+# Gmail Pub-Sub Classification System
+# =============================================================================
+
+async def classification_worker():
+    """Background worker to process classification queue.
+
+    Runs continuously, processing emails queued for local MLX classification.
+    """
+    config = get_config()
+    queue = await get_queue()
+    last_cleanup = 0
+    cleanup_interval = 86400  # Run cleanup once per day
+
+    logger.info("Classification worker running")
+
+    while True:
+        try:
+            # Get pending items (marks them as in-progress)
+            pending = await queue.get_pending(limit=config.worker_batch_size)
+
+            for entry in pending:
+                message_id = entry["message_id"]
+                try:
+                    # Fetch and truncate body using helper
+                    body = await fetch_email_body(message_id)
+
+                    # Classify with local MLX
+                    llm_response = await call_local_llm(TRIAGE_SYSTEM_PROMPT, body)
+
+                    # Parse response
+                    try:
+                        classification = json.loads(llm_response)
+                    except json.JSONDecodeError:
+                        classification = {"summary": llm_response}
+
+                    # Apply label using helper
+                    await apply_classification_label(message_id, "agent/local")
+
+                    # Mark as processed
+                    await queue.mark_processed(message_id, classification)
+                    logger.info(f"Classified email {message_id} via MLX")
+
+                except Exception as e:
+                    error_msg = str(e)
+                    logger.error(f"Failed to classify {message_id}: {error_msg}")
+
+                    # Increment retry count
+                    retries = await queue.increment_retry(message_id)
+                    if retries >= 3:
+                        # Mark as failed after 3 retries
+                        await queue.mark_processed(message_id, error=error_msg)
+                        logger.error(f"Giving up on {message_id} after 3 retries")
+
+            # Periodic cleanup - run once per day, not every poll
+            current_time = time.time()
+            if current_time - last_cleanup > cleanup_interval:
+                deleted = await queue.cleanup_old_entries(config.queue_retention_days)
+                if deleted > 0:
+                    logger.info(f"Cleaned up {deleted} old queue entries")
+                last_cleanup = current_time
+
+            # Sleep before next poll
+            await asyncio.sleep(config.worker_poll_interval)
+
+        except asyncio.CancelledError:
+            logger.info("Classification worker cancelled")
+            raise
+        except Exception as e:
+            logger.error(f"Worker error: {e}")
+            await asyncio.sleep(30)  # Back off on error
+
+
+async def process_pubsub_notification(message_id: str) -> dict:
+    """Process a Gmail Pub-Sub notification.
+
+    1. Fetch email metadata (sender, subject, snippet)
+    2. Check whitelist → if match, queue for MLX
+    3. Call cloud LLM for person detection
+    4. If person → queue for MLX
+    5. If not person → classify with cloud LLM, apply label
+
+    Args:
+        message_id: Gmail message ID to process.
+
+    Returns:
+        Dict with action taken and result details.
+    """
+    config = get_config()
+    client = get_gmail_client()
+    cloud_llm = get_cloud_llm_client()
+    queue = await get_queue()
+
+    # Fetch message metadata (not full body yet)
+    msg = await client.get_message(message_id, format="metadata")
+    payload = msg.get("payload", {})
+    headers = payload.get("headers", [])
+
+    from_addr = get_header(headers, "From")
+    subject = get_header(headers, "Subject")
+    snippet = msg.get("snippet", "")
+
+    # Extract email address using helper
+    sender_email = extract_sender_email(from_addr)
+
+    # Helper to enqueue with duplicate handling
+    async def try_enqueue() -> bool:
+        """Try to enqueue, return False if already exists."""
+        try:
+            await queue.enqueue(message_id, from_addr, subject, snippet)
+            return True
+        except sqlite3.IntegrityError:
+            return False
+
+    # Check whitelist first (fast path)
+    if config.is_whitelisted(sender_email):
+        if not await try_enqueue():
+            return {"action": "skipped", "reason": "already_in_queue"}
+        return {
+            "action": "queued_for_mlx",
+            "reason": "whitelisted",
+            "is_person": True,
+        }
+
+    # Person detection (cloud LLM, metadata only - no body sent)
+    detection = await cloud_llm.detect_person(from_addr, subject, snippet)
+
+    if detection["is_person"]:
+        # Queue for local MLX processing (body stays local)
+        if not await try_enqueue():
+            return {"action": "skipped", "reason": "already_in_queue"}
+        return {
+            "action": "queued_for_mlx",
+            "reason": "person_detected",
+            "is_person": True,
+            "confidence": detection["confidence"],
+        }
+    else:
+        # Non-person email: fetch full body and classify with cloud LLM
+        body = await fetch_email_body(message_id)
+        classification = await cloud_llm.classify_email(from_addr, subject, body)
+
+        # Apply label using helper
+        await apply_classification_label(message_id, "agent/cloud")
+
+        return {
+            "action": "classified_cloud",
+            "is_person": False,
+            "confidence": detection["confidence"],
+            "classification": classification,
+        }
+
+
+@app.post("/pubsub/webhook", response_model=ClassificationResponse)
+async def pubsub_webhook(
+    notification: PubSubNotification,
+    background_tasks: BackgroundTasks,
+):
+    """Receive Gmail Pub-Sub notifications.
+
+    This endpoint receives push notifications from Gmail via Google Cloud Pub-Sub.
+    It triggers email classification based on person detection.
+
+    - Personal emails → queued for local MLX classification
+    - Non-personal emails → classified immediately by cloud LLM
+
+    Returns 200 quickly to avoid Pub-Sub retries (processing happens in background).
+    """
+    try:
+        # Decode Pub-Sub message data
+        message_data = notification.message.get("data", "")
+        if message_data:
+            decoded = base64.b64decode(message_data).decode("utf-8")
+            data = json.loads(decoded)
+        else:
+            data = {}
+
+        email_address = data.get("emailAddress", "")
+        history_id = data.get("historyId", "")
+
+        logger.info(f"Pub-Sub notification: email={email_address}, history={history_id}")
+
+        # If we have a specific message_id (e.g., from manual testing), process it
+        message_id = data.get("message_id")
+        if message_id:
+            result = await process_pubsub_notification(message_id)
+            return ClassificationResponse(
+                success=True,
+                message_id=message_id,
+                action=result["action"],
+                is_person=result.get("is_person"),
+                classification=result.get("classification"),
+            )
+
+        # For history-based notifications, fetch new messages via history API
+        if history_id:
+            client = get_gmail_client()
+            processed_count = 0
+            queued_count = 0
+
+            try:
+                # Fetch history of changes (only messagesAdded to INBOX)
+                history_response = await client.list_history(
+                    start_history_id=history_id,
+                    label_id="INBOX",
+                    history_types=["messageAdded"],
+                )
+
+                # Process each new message in background
+                for history_item in history_response.get("history", []):
+                    for msg_added in history_item.get("messagesAdded", []):
+                        msg_id = msg_added.get("message", {}).get("id")
+                        if msg_id:
+                            # Process in background to respond quickly
+                            background_tasks.add_task(
+                                process_pubsub_notification, msg_id
+                            )
+                            queued_count += 1
+
+                return ClassificationResponse(
+                    success=True,
+                    message_id=history_id,
+                    action="processing",
+                    classification={"queued_messages": queued_count},
+                )
+
+            except Exception as history_err:
+                # History API can fail if historyId is too old
+                logger.warning(f"History API error (may be stale): {history_err}")
+                return ClassificationResponse(
+                    success=True,
+                    message_id=history_id,
+                    action="history_expired",
+                    error=str(history_err),
+                )
+
+        return ClassificationResponse(
+            success=True,
+            message_id="",
+            action="no_action",
+            error="No historyId or message_id provided",
+        )
+
+    except Exception as e:
+        logger.error(f"Pub-Sub webhook error: {e}")
+        # Always return 200 to avoid Pub-Sub retries
+        return ClassificationResponse(
+            success=False,
+            message_id="",
+            action="error",
+            error=str(e),
+        )
+
+
+@app.post("/classify/{message_id}", response_model=ClassificationResponse)
+async def classify_email_endpoint(message_id: str):
+    """Manually trigger classification for a specific email.
+
+    Useful for testing or processing emails that weren't caught by Pub-Sub.
+    """
+    try:
+        result = await process_pubsub_notification(message_id)
+        return ClassificationResponse(
+            success=True,
+            message_id=message_id,
+            action=result["action"],
+            is_person=result.get("is_person"),
+            classification=result.get("classification"),
+        )
+    except Exception as e:
+        return ClassificationResponse(
+            success=False,
+            message_id=message_id,
+            action="error",
+            error=format_proxy_error(e),
+        )
+
+
+@app.get("/queue/status", response_model=QueueStatusResponse)
+async def queue_status():
+    """Get classification queue statistics."""
+    queue = await get_queue()
+    stats = await queue.get_stats()
+    return QueueStatusResponse(**stats)
+
+
+@app.get("/config/whitelist")
+async def get_whitelist():
+    """Get current sender whitelist."""
+    config = get_config()
+    return {"whitelist": config.sender_whitelist}
+
+
+@app.post("/config/whitelist")
+async def add_to_whitelist(request: WhitelistRequest):
+    """Add a sender pattern to the whitelist.
+
+    Note: This only affects the in-memory whitelist for this session.
+    To persist, add to SENDER_WHITELIST environment variable.
+    """
+    config = get_config()
+    pattern = request.sender_pattern.lower()
+    if pattern not in config.sender_whitelist:
+        config.sender_whitelist.append(pattern)
+    return {
+        "success": True,
+        "message": f"Added '{pattern}' to whitelist",
+        "whitelist": config.sender_whitelist,
+    }
