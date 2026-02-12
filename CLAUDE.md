@@ -35,10 +35,12 @@ The test suite uses mocked proxy client and LLM responses - no credentials requi
 - `email_server.py` - Main FastAPI application with all endpoints
 - `proxy_client.py` - Gmail API proxy client (handles proxy authentication and requests)
 - `gmail_utils.py` - Gmail message parsing utilities (header extraction, body decoding)
+- `message_builder.py` - RFC 2822 email construction for draft creation (base64url encoding for Gmail API)
 - `.env.example` - Template for environment variables
 - `tests/` - Test suite
   - `conftest.py` - Shared fixtures and sample data
   - `test_email_server.py` - Endpoint and utility tests
+  - `test_drafts.py` - Draft endpoint and message builder tests
   - `test_readme_documentation.py` - Verifies all endpoints are documented in README
 - `pyproject.toml` - Project metadata and dependencies
 
@@ -64,6 +66,11 @@ The test suite uses mocked proxy client and LLM responses - no credentials requi
 - `POST /archive` - Archive an email
 - `POST /batch-summarize` - Summarize multiple emails with triage info (detected_action, detected_deadline)
 - `POST /bulk-actions` - Apply multiple operations to multiple emails
+- `POST /drafts/create` - Create a new email draft from structured fields
+- `GET /drafts` - List all drafts with preview info
+- `GET /drafts/{draft_id}` - Get full details of a specific draft
+- `POST /drafts/{draft_id}/update` - Update an existing draft
+- `DELETE /drafts/{draft_id}` - Delete a draft permanently
 
 ## Environment Variables
 
@@ -84,12 +91,13 @@ The email agent communicates with Gmail through the [api-proxy](https://github.c
 - List and retrieve labels
 - Modify message labels (add/remove)
 - Trash/untrash messages
+- Create, read, update, and delete drafts
 
 ### Blocked Operations
 
 The proxy blocks these operations (returns 403):
 - Sending email
-- Creating/modifying/sending drafts
+- Sending drafts
 - Importing/inserting messages
 
 ### Error Handling

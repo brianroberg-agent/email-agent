@@ -20,6 +20,7 @@ from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 
 from gmail_utils import get_header, decode_body
+from message_builder import build_rfc2822
 from proxy_client import (
     get_gmail_client,
     ProxyAuthError,
@@ -212,6 +213,49 @@ class BulkActionsResponse(BaseModel):
     results: list[EmailActionResult]
     success_count: int
     error_count: int
+    error: Optional[str] = None
+
+
+class DraftRequest(BaseModel):
+    to: list[str] = Field(..., description="Recipient email addresses")
+    subject: str = Field(..., description="Email subject")
+    body: str = Field(..., description="Email body (plain text)")
+    cc: Optional[list[str]] = Field(None, description="CC recipients")
+    bcc: Optional[list[str]] = Field(None, description="BCC recipients")
+    in_reply_to: Optional[str] = Field(None, description="Message-ID to reply to (for threading)")
+    references: Optional[list[str]] = Field(None, description="Thread Message-IDs (for threading)")
+
+
+class DraftResponse(BaseModel):
+    success: bool
+    draft_id: Optional[str] = None
+    message: str
+    error: Optional[str] = None
+
+
+class DraftSummary(BaseModel):
+    id: str
+    to: list[str]
+    subject: str
+    snippet: str
+
+
+class ListDraftsResponse(BaseModel):
+    success: bool
+    drafts: list[DraftSummary]
+    error: Optional[str] = None
+
+
+class GetDraftResponse(BaseModel):
+    success: bool
+    draft_id: Optional[str] = None
+    to: Optional[list[str]] = None
+    cc: Optional[list[str]] = None
+    bcc: Optional[list[str]] = None
+    subject: Optional[str] = None
+    body: Optional[str] = None
+    in_reply_to: Optional[str] = None
+    references: Optional[list[str]] = None
     error: Optional[str] = None
 
 
@@ -684,3 +728,168 @@ async def bulk_actions(request: BulkActionsRequest):
             error_count=0,
             error=format_proxy_error(e),
         )
+
+
+# =============================================================================
+# DRAFT OPERATIONS
+# =============================================================================
+
+
+@app.post("/drafts/create", response_model=DraftResponse)
+async def create_draft(request: DraftRequest):
+    """Create a new email draft from structured fields.
+
+    Constructs an RFC 2822 message from the provided fields and saves it
+    as a draft in Gmail. Supports reply threading via in_reply_to and references.
+    """
+    try:
+        raw_message = build_rfc2822(
+            to=request.to,
+            subject=request.subject,
+            body=request.body,
+            cc=request.cc,
+            bcc=request.bcc,
+            in_reply_to=request.in_reply_to,
+            references=request.references,
+        )
+
+        client = get_gmail_client()
+        result = await client.create_draft(raw_message)
+
+        draft_id = result.get("id")
+        return DraftResponse(
+            success=True,
+            draft_id=draft_id,
+            message=f"Draft created: {draft_id}",
+        )
+
+    except ValueError as e:
+        return DraftResponse(success=False, message="", error=str(e))
+    except Exception as e:
+        return DraftResponse(success=False, message="", error=format_proxy_error(e))
+
+
+@app.get("/drafts", response_model=ListDraftsResponse)
+async def list_drafts():
+    """List all drafts with preview information.
+
+    Returns draft metadata including recipients and snippet for each draft.
+    """
+    try:
+        client = get_gmail_client()
+        result = await client.list_drafts()
+
+        drafts = []
+        for draft_stub in result.get("drafts", []):
+            draft = await client.get_draft(draft_stub["id"], format="full")
+            message = draft.get("message", {})
+
+            payload = message.get("payload", {})
+            headers = payload.get("headers", [])
+
+            to_header = get_header(headers, "To")
+            subject = get_header(headers, "Subject")
+
+            drafts.append(DraftSummary(
+                id=draft["id"],
+                to=[addr.strip() for addr in to_header.split(",")] if to_header else [],
+                subject=subject,
+                snippet=message.get("snippet", ""),
+            ))
+
+        return ListDraftsResponse(success=True, drafts=drafts)
+
+    except Exception as e:
+        return ListDraftsResponse(success=False, drafts=[], error=format_proxy_error(e))
+
+
+@app.get("/drafts/{draft_id}", response_model=GetDraftResponse)
+async def get_draft(draft_id: str):
+    """Get full details of a specific draft.
+
+    Returns structured fields parsed from the draft message.
+    """
+    try:
+        client = get_gmail_client()
+        result = await client.get_draft(draft_id, format="full")
+
+        message = result.get("message", {})
+        payload = message.get("payload", {})
+        headers = payload.get("headers", [])
+
+        to_raw = get_header(headers, "To")
+        to = [addr.strip() for addr in to_raw.split(",")] if to_raw else []
+
+        cc_raw = get_header(headers, "Cc")
+        cc = [addr.strip() for addr in cc_raw.split(",")] if cc_raw else None
+
+        bcc_raw = get_header(headers, "Bcc")
+        bcc = [addr.strip() for addr in bcc_raw.split(",")] if bcc_raw else None
+
+        subject = get_header(headers, "Subject")
+
+        in_reply_to = get_header(headers, "In-Reply-To") or None
+        references_header = get_header(headers, "References")
+        references = references_header.split() if references_header else None
+
+        body = decode_body(payload)
+
+        return GetDraftResponse(
+            success=True,
+            draft_id=draft_id,
+            to=to,
+            cc=cc,
+            bcc=bcc,
+            subject=subject,
+            body=body,
+            in_reply_to=in_reply_to,
+            references=references,
+        )
+
+    except Exception as e:
+        return GetDraftResponse(success=False, error=format_proxy_error(e))
+
+
+@app.post("/drafts/{draft_id}/update", response_model=DraftResponse)
+async def update_draft(draft_id: str, request: DraftRequest):
+    """Update an existing draft with new content.
+
+    Replaces the draft's message with a new RFC 2822 message built
+    from the provided structured fields.
+    """
+    try:
+        raw_message = build_rfc2822(
+            to=request.to,
+            subject=request.subject,
+            body=request.body,
+            cc=request.cc,
+            bcc=request.bcc,
+            in_reply_to=request.in_reply_to,
+            references=request.references,
+        )
+
+        client = get_gmail_client()
+        await client.update_draft(draft_id, raw_message)
+
+        return DraftResponse(
+            success=True,
+            draft_id=draft_id,
+            message=f"Draft updated: {draft_id}",
+        )
+
+    except ValueError as e:
+        return DraftResponse(success=False, message="", error=str(e))
+    except Exception as e:
+        return DraftResponse(success=False, message="", error=format_proxy_error(e))
+
+
+@app.delete("/drafts/{draft_id}", response_model=ActionResponse)
+async def delete_draft(draft_id: str):
+    """Delete a draft permanently."""
+    try:
+        client = get_gmail_client()
+        await client.delete_draft(draft_id)
+        return ActionResponse(success=True, message=f"Draft deleted: {draft_id}")
+
+    except Exception as e:
+        return ActionResponse(success=False, message=format_proxy_error(e))

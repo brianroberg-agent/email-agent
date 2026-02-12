@@ -252,6 +252,124 @@ class GmailProxyClient:
             return self._handle_response(response)
 
 
+    async def list_drafts(
+        self,
+        user_id: str = "me",
+        max_results: int = 10,
+        q: Optional[str] = None,
+    ) -> dict:
+        """List drafts in the user's mailbox.
+
+        Args:
+            user_id: The user's email address or 'me' for authenticated user.
+            max_results: Maximum number of drafts to return.
+            q: Gmail search query string.
+
+        Returns:
+            Dict with 'drafts' key containing list of draft stubs.
+        """
+        url = f"{self.proxy_url}/gmail/v1/users/{user_id}/drafts"
+        params: dict = {"maxResults": max_results}
+        if q:
+            params["q"] = q
+
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            response = await client.get(url, headers=self._get_headers(), params=params)
+            return self._handle_response(response)
+
+    async def get_draft(
+        self,
+        draft_id: str,
+        user_id: str = "me",
+        format: str = "full",
+    ) -> dict:
+        """Get a specific draft by ID.
+
+        Args:
+            draft_id: The ID of the draft to retrieve.
+            user_id: The user's email address or 'me' for authenticated user.
+            format: The format to return the draft in ('full', 'metadata', 'minimal', 'raw').
+
+        Returns:
+            The draft resource with embedded message.
+        """
+        url = f"{self.proxy_url}/gmail/v1/users/{user_id}/drafts/{draft_id}"
+        params = {"format": format}
+
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            response = await client.get(url, headers=self._get_headers(), params=params)
+            return self._handle_response(response)
+
+    async def create_draft(
+        self,
+        raw_message: str,
+        user_id: str = "me",
+    ) -> dict:
+        """Create a new draft.
+
+        Args:
+            raw_message: Base64url-encoded RFC 2822 message string.
+            user_id: The user's email address or 'me' for authenticated user.
+
+        Returns:
+            The created draft resource.
+        """
+        url = f"{self.proxy_url}/gmail/v1/users/{user_id}/drafts"
+        body = {"message": {"raw": raw_message}}
+
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            response = await client.post(url, headers=self._get_headers(), json=body)
+            return self._handle_response(response)
+
+    async def update_draft(
+        self,
+        draft_id: str,
+        raw_message: str,
+        user_id: str = "me",
+    ) -> dict:
+        """Update an existing draft.
+
+        Args:
+            draft_id: The ID of the draft to update.
+            raw_message: Base64url-encoded RFC 2822 message string.
+            user_id: The user's email address or 'me' for authenticated user.
+
+        Returns:
+            The updated draft resource.
+        """
+        url = f"{self.proxy_url}/gmail/v1/users/{user_id}/drafts/{draft_id}"
+        body = {"message": {"raw": raw_message}}
+
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            response = await client.put(url, headers=self._get_headers(), json=body)
+            return self._handle_response(response)
+
+    async def delete_draft(
+        self,
+        draft_id: str,
+        user_id: str = "me",
+    ) -> None:
+        """Delete a draft.
+
+        Args:
+            draft_id: The ID of the draft to delete.
+            user_id: The user's email address or 'me' for authenticated user.
+
+        Raises:
+            ProxyAuthError: For 401 responses.
+            ProxyForbiddenError: For 403 responses.
+            ProxyError: For other error responses.
+        """
+        url = f"{self.proxy_url}/gmail/v1/users/{user_id}/drafts/{draft_id}"
+
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            response = await client.delete(url, headers=self._get_headers())
+            # Gmail API returns 204 No Content on successful delete
+            if response.status_code == 204:
+                return
+            self._handle_response(response)
+
+
 # Singleton instance for convenience
 _client: Optional[GmailProxyClient] = None
 

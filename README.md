@@ -331,6 +331,77 @@ Response:
 }
 ```
 
+### POST /drafts/create
+
+Create a new email draft from structured fields. Constructs an RFC 2822 message internally.
+
+```bash
+curl -X POST http://localhost:8081/drafts/create \
+  -H "Content-Type: application/json" \
+  -d '{"to": ["alice@example.com"], "subject": "Meeting follow-up", "body": "Thanks for the meeting.", "cc": ["bob@example.com"]}'
+```
+
+Fields: `to` (required), `subject` (required), `body` (required), `cc`, `bcc`, `in_reply_to`, `references`.
+
+Response:
+```json
+{"success": true, "draft_id": "r1234567890", "message": "Draft created: r1234567890", "error": null}
+```
+
+### GET /drafts
+
+List all drafts with preview information.
+
+```bash
+curl http://localhost:8081/drafts
+```
+
+Response:
+```json
+{"success": true, "drafts": [{"id": "r123", "to": ["alice@example.com"], "subject": "Draft subject", "snippet": "Draft body preview..."}], "error": null}
+```
+
+### GET /drafts/{draft_id}
+
+Get full details of a specific draft.
+
+```bash
+curl http://localhost:8081/drafts/{draft_id}
+```
+
+Response:
+```json
+{"success": true, "draft_id": "r1234567890", "to": ["alice@example.com"], "cc": null, "bcc": null, "subject": "Draft subject", "body": "Full draft body text", "in_reply_to": null, "references": null, "error": null}
+```
+
+### POST /drafts/{draft_id}/update
+
+Update an existing draft with new content.
+
+```bash
+curl -X POST http://localhost:8081/drafts/{draft_id}/update \
+  -H "Content-Type: application/json" \
+  -d '{"to": ["bob@example.com"], "subject": "Updated subject", "body": "Updated body"}'
+```
+
+Response:
+```json
+{"success": true, "draft_id": "r1234567890", "message": "Draft updated: r1234567890", "error": null}
+```
+
+### DELETE /drafts/{draft_id}
+
+Delete a draft permanently.
+
+```bash
+curl -X DELETE http://localhost:8081/drafts/{draft_id}
+```
+
+Response:
+```json
+{"success": true, "message": "Draft deleted: r1234567890"}
+```
+
 ## Proxy Server
 
 This server requires access to an [api-proxy](https://github.com/brianroberg/api-proxy) instance that handles Gmail OAuth and human-in-the-loop controls.
@@ -342,12 +413,13 @@ The proxy permits these Gmail API operations:
 - List and retrieve labels
 - Modify message labels (add/remove)
 - Trash/untrash messages
+- Create, read, update, and delete drafts
 
 ### Blocked Operations
 
 The proxy blocks these operations (returns 403 Forbidden):
 - Sending email
-- Creating, modifying, or sending drafts
+- Sending drafts
 - Importing or inserting messages
 
 ### Error Responses
