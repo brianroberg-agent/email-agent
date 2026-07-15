@@ -88,13 +88,18 @@ class SearchRequest(BaseModel):
 
 class MessageSummary(BaseModel):
     id: str
+    thread_id: str
     date: str
     from_addr: str
     from_name: str
+    to: str
+    cc: str
     subject: str
     snippet: str
     labels: list[str]
     has_attachments: bool
+    message_id: str = Field("", description="RFC 2822 Message-ID header (for reply threading)")
+    references: list[str] = Field(default_factory=list, description="RFC 2822 References Message-IDs")
 
 
 class SearchResponse(BaseModel):
@@ -504,15 +509,21 @@ async def search(request: SearchRequest):
             payload = msg.get("payload", {})
             headers = payload.get("headers", [])
             from_addr = get_header(headers, "From")
+            references_header = get_header(headers, "References")
             messages.append(MessageSummary(
                 id=msg["id"],
+                thread_id=msg.get("threadId", ""),
                 date=get_header(headers, "Date"),
                 from_addr=from_addr,
                 from_name=parse_sender_name(from_addr),
+                to=get_header(headers, "To"),
+                cc=get_header(headers, "Cc"),
                 subject=get_header(headers, "Subject"),
                 snippet=msg.get("snippet", ""),
                 labels=msg.get("labelIds", []),
                 has_attachments=has_attachments(payload),
+                message_id=get_header(headers, "Message-ID"),
+                references=references_header.split() if references_header else [],
             ))
 
         return SearchResponse(success=True, messages=messages, error=None)

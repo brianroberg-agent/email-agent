@@ -68,7 +68,7 @@ The test suite uses mocked proxy client and LLM responses - no credentials requi
 
 - `GET /health` - Health check
 - `GET /labels` - List available Gmail labels with message counts
-- `POST /search` - Search emails with structured filters (returns from_name, has_attachments)
+- `POST /search` - Search emails with structured filters (returns from_name, to, cc, thread_id, has_attachments, and RFC 2822 message_id/references for reply threading)
 - `POST /summarize` - Summarize an email (uses local LLM)
 - `POST /ask-about` - Ask a question about an email (uses local LLM)
 - `POST /mark-read` - Mark email as read

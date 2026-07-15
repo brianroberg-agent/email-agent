@@ -148,6 +148,26 @@ SAMPLE_MESSAGES = {
             ]
         }
     },
+    "sent_reply": {
+        "id": "msg_reply",
+        "threadId": "thread_reply",
+        "labelIds": ["SENT"],
+        "snippet": "Sounds good, see you then.",
+        "payload": {
+            "headers": [
+                {"name": "From", "value": "Reply Sender <replier@example.com>"},
+                {"name": "To", "value": "Jane Colleague <jane@example.com>"},
+                {"name": "Cc", "value": "team@example.com"},
+                {"name": "Subject", "value": "Re: Meeting next week"},
+                {"name": "Date", "value": "Jul 15, 2026 9:00 AM"},
+                {"name": "Message-ID", "value": "<reply-abc@mail.gmail.com>"},
+                {"name": "References", "value": "<orig-123@example.com> <mid-456@example.com>"},
+            ],
+            "body": {
+                "data": _encode_body("Sounds good, see you then.")
+            }
+        }
+    },
     "without_attachment": {
         "id": "msg_no_attach",
         "threadId": "thread_no_attach",

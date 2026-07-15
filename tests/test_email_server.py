@@ -277,6 +277,75 @@ class TestSearchEndpoint:
         assert msg["has_attachments"] is False
 
     @patch("email_server.get_gmail_client")
+    def test_search_returns_recipient_headers(self, mock_get_client, client):
+        """Search stubs include To and Cc so addresses are recoverable (issue #2)."""
+        mock_proxy_client = AsyncMock()
+        mock_get_client.return_value = mock_proxy_client
+
+        mock_proxy_client.list_messages.return_value = {
+            "messages": [{"id": "msg_reply", "threadId": "thread_reply"}]
+        }
+        mock_proxy_client.get_message.return_value = SAMPLE_MESSAGES["sent_reply"]
+
+        response = client.post("/search", json={"limit": 1})
+        msg = response.json()["messages"][0]
+
+        assert msg["to"] == "Jane Colleague <jane@example.com>"
+        assert msg["cc"] == "team@example.com"
+
+    @patch("email_server.get_gmail_client")
+    def test_search_returns_thread_id(self, mock_get_client, client):
+        mock_proxy_client = AsyncMock()
+        mock_get_client.return_value = mock_proxy_client
+
+        mock_proxy_client.list_messages.return_value = {
+            "messages": [{"id": "msg_reply", "threadId": "thread_reply"}]
+        }
+        mock_proxy_client.get_message.return_value = SAMPLE_MESSAGES["sent_reply"]
+
+        response = client.post("/search", json={"limit": 1})
+        msg = response.json()["messages"][0]
+
+        assert msg["thread_id"] == "thread_reply"
+
+    @patch("email_server.get_gmail_client")
+    def test_search_returns_message_id_and_references(self, mock_get_client, client):
+        """RFC 2822 Message-ID and References enable threaded reply drafts (issue #2)."""
+        mock_proxy_client = AsyncMock()
+        mock_get_client.return_value = mock_proxy_client
+
+        mock_proxy_client.list_messages.return_value = {
+            "messages": [{"id": "msg_reply", "threadId": "thread_reply"}]
+        }
+        mock_proxy_client.get_message.return_value = SAMPLE_MESSAGES["sent_reply"]
+
+        response = client.post("/search", json={"limit": 1})
+        msg = response.json()["messages"][0]
+
+        assert msg["message_id"] == "<reply-abc@mail.gmail.com>"
+        assert msg["references"] == ["<orig-123@example.com>", "<mid-456@example.com>"]
+
+    @patch("email_server.get_gmail_client")
+    def test_search_header_fields_default_when_absent(self, mock_get_client, client):
+        """Messages without To/Cc/Message-ID/References headers get empty defaults."""
+        mock_proxy_client = AsyncMock()
+        mock_get_client.return_value = mock_proxy_client
+
+        mock_proxy_client.list_messages.return_value = {
+            "messages": [{"id": "msg123", "threadId": "thread123"}]
+        }
+        mock_proxy_client.get_message.return_value = SAMPLE_MESSAGES["basic"]
+
+        response = client.post("/search", json={"limit": 1})
+        msg = response.json()["messages"][0]
+
+        assert msg["to"] == ""
+        assert msg["cc"] == ""
+        assert msg["thread_id"] == "thread123"
+        assert msg["message_id"] == ""
+        assert msg["references"] == []
+
+    @patch("email_server.get_gmail_client")
     @pytest.mark.parametrize("error_message", [
         "Gmail API error",
         "Connection refused",

@@ -117,7 +117,7 @@ Note: `messages_total` and `messages_unread` may be `null` for some labels when 
 
 ### POST /search
 
-Search Gmail with structured parameters. Returns message metadata including snippets.
+Search Gmail with structured parameters. Returns message metadata including snippets, sender/recipient addresses (`from_addr`, `to`, `cc`), the Gmail `thread_id`, and RFC 2822 `message_id`/`references` headers (usable with the draft endpoints' `in_reply_to`/`references` fields for reply threading).
 
 ```bash
 curl -X POST http://localhost:8081/search \
@@ -144,13 +144,18 @@ Response:
   "messages": [
     {
       "id": "18d5a3b2c4e5f6a7",
+      "thread_id": "18d5a3b2c4e5f001",
       "date": "Jan 25, 2026 3:42 PM",
       "from_addr": "Sender Name <sender@example.com>",
       "from_name": "Sender Name",
+      "to": "Recipient Name <recipient@example.com>",
+      "cc": "",
       "subject": "Re: Topic",
       "snippet": "Thanks for reaching out...",
       "labels": ["INBOX", "UNREAD"],
-      "has_attachments": false
+      "has_attachments": false,
+      "message_id": "<CABc123@mail.example.com>",
+      "references": ["<CAAa456@mail.example.com>"]
     }
   ],
   "error": null
