@@ -117,7 +117,14 @@ Note: `messages_total` and `messages_unread` may be `null` for some labels when 
 
 ### POST /search
 
-Search Gmail with structured parameters. Returns message metadata including snippets, sender/recipient addresses (`from_addr`, `to`, `cc`), the Gmail `thread_id`, and RFC 2822 `message_id`/`references` headers (usable with the draft endpoints' `in_reply_to`/`references` fields for reply threading).
+Search Gmail with structured parameters. Returns message metadata including snippets, sender/recipient addresses (`from_addr`, `to`, `cc`, `bcc`), the Gmail `thread_id`, and RFC 2822 threading headers (`rfc822_message_id`, `in_reply_to`, `references`).
+
+Note that `id`/`thread_id` are Gmail API identifiers (use `id` with `/summarize`, `/ask-about`, etc., and `thread_id` with `/drafts/create`), while `rfc822_message_id`/`in_reply_to`/`references` are RFC 2822 email header values.
+
+To draft a reply to a search result, pass to `/drafts/create`:
+- `thread_id`: the result's `thread_id` (attaches the draft to the Gmail conversation)
+- `in_reply_to`: the result's `rfc822_message_id`
+- `references`: the result's `references` with its `rfc822_message_id` appended (per RFC 5322; if `references` is empty but `in_reply_to` is set, use `[in_reply_to, rfc822_message_id]`)
 
 ```bash
 curl -X POST http://localhost:8081/search \
@@ -148,13 +155,15 @@ Response:
       "date": "Jan 25, 2026 3:42 PM",
       "from_addr": "Sender Name <sender@example.com>",
       "from_name": "Sender Name",
-      "to": "Recipient Name <recipient@example.com>",
-      "cc": "",
+      "to": ["Recipient Name <recipient@example.com>"],
+      "cc": [],
+      "bcc": [],
       "subject": "Re: Topic",
       "snippet": "Thanks for reaching out...",
       "labels": ["INBOX", "UNREAD"],
       "has_attachments": false,
-      "message_id": "<CABc123@mail.example.com>",
+      "rfc822_message_id": "<CABc123@mail.example.com>",
+      "in_reply_to": "<CAAa456@mail.example.com>",
       "references": ["<CAAa456@mail.example.com>"]
     }
   ],
@@ -346,7 +355,9 @@ curl -X POST http://localhost:8081/drafts/create \
   -d '{"to": ["alice@example.com"], "subject": "Meeting follow-up", "body": "Thanks for the meeting.", "cc": ["bob@example.com"]}'
 ```
 
-Fields: `to` (required), `subject` (required), `body` (required), `cc`, `bcc`, `in_reply_to`, `references`.
+Fields: `to` (required), `subject` (required), `body` (required), `cc`, `bcc`, `in_reply_to`, `references`, `thread_id`.
+
+For reply drafts, set `thread_id` (from the `/search` result) so the draft attaches to the existing Gmail conversation, and build `in_reply_to`/`references` from the result's RFC 2822 headers as described under `POST /search`. The same fields apply to `POST /drafts/{draft_id}/update`.
 
 Response:
 ```json

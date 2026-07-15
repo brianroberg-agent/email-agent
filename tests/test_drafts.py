@@ -217,6 +217,41 @@ class TestCreateDraftEndpoint:
         decoded = base64.urlsafe_b64decode(raw_msg).decode("utf-8")
         assert "In-Reply-To: <msg123@example.com>" in decoded
 
+    @patch("email_server.get_gmail_client")
+    def test_create_draft_with_thread_id(self, mock_get_client, client):
+        """thread_id is forwarded so the draft attaches to its Gmail conversation."""
+        mock_proxy = AsyncMock()
+        mock_get_client.return_value = mock_proxy
+        mock_proxy.create_draft.return_value = {"id": "r790"}
+
+        response = client.post("/drafts/create", json={
+            "to": ["alice@example.com"],
+            "subject": "Re: Thread",
+            "body": "Reply body",
+            "in_reply_to": "<msg123@example.com>",
+            "references": ["<msg123@example.com>"],
+            "thread_id": "thread_abc",
+        })
+
+        assert response.status_code == 200
+        assert response.json()["success"] is True
+        assert mock_proxy.create_draft.call_args.kwargs["thread_id"] == "thread_abc"
+
+    @patch("email_server.get_gmail_client")
+    def test_create_draft_without_thread_id(self, mock_get_client, client):
+        mock_proxy = AsyncMock()
+        mock_get_client.return_value = mock_proxy
+        mock_proxy.create_draft.return_value = {"id": "r791"}
+
+        response = client.post("/drafts/create", json={
+            "to": ["alice@example.com"],
+            "subject": "Test",
+            "body": "Body",
+        })
+
+        assert response.status_code == 200
+        assert mock_proxy.create_draft.call_args.kwargs["thread_id"] is None
+
     def test_create_draft_missing_to(self, client):
         response = client.post("/drafts/create", json={
             "subject": "Test",
@@ -361,6 +396,31 @@ class TestGetDraftEndpoint:
         assert data["in_reply_to"] == "<msg@example.com>"
 
     @patch("email_server.get_gmail_client")
+    def test_get_draft_quoted_display_name_not_split(self, mock_get_client, client):
+        """Recipient display names containing commas parse as one address."""
+        mock_proxy = AsyncMock()
+        mock_get_client.return_value = mock_proxy
+        mock_proxy.get_draft.return_value = {
+            "id": "r124",
+            "message": {
+                "payload": {
+                    "headers": [
+                        {"name": "To", "value": '"Doe, John" <j@x.com>, jane@y.com'},
+                        {"name": "Subject", "value": "Test Draft"},
+                    ],
+                    "body": {
+                        "data": base64.urlsafe_b64encode(b"Draft body text").decode(),
+                    },
+                },
+            },
+        }
+
+        response = client.get("/drafts/r124")
+        data = response.json()
+        assert data["success"] is True
+        assert data["to"] == ['"Doe, John" <j@x.com>', "jane@y.com"]
+
+    @patch("email_server.get_gmail_client")
     def test_get_draft_proxy_error(self, mock_get_client, client):
         from proxy_client import ProxyError
         mock_proxy = AsyncMock()
@@ -409,6 +469,23 @@ class TestUpdateDraftEndpoint:
         decoded = base64.urlsafe_b64decode(raw_msg).decode("utf-8")
         assert "bob@example.com" in decoded
         assert "Updated subject" in decoded
+
+    @patch("email_server.get_gmail_client")
+    def test_update_draft_with_thread_id(self, mock_get_client, client):
+        mock_proxy = AsyncMock()
+        mock_get_client.return_value = mock_proxy
+        mock_proxy.update_draft.return_value = {"id": "r123"}
+
+        response = client.post("/drafts/r123/update", json={
+            "to": ["alice@example.com"],
+            "subject": "Re: Thread",
+            "body": "Updated reply",
+            "thread_id": "thread_abc",
+        })
+
+        assert response.status_code == 200
+        assert response.json()["success"] is True
+        assert mock_proxy.update_draft.call_args.kwargs["thread_id"] == "thread_abc"
 
     def test_update_draft_missing_fields(self, client):
         response = client.post("/drafts/r123/update", json={

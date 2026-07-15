@@ -16,7 +16,7 @@ Use red/green TDD whenever editing Python code:
 2. **Green**: Write the minimal implementation that makes the test pass. Run the test suite and confirm it passes.
 3. Refactor if needed, keeping tests green.
 
-Do not write or modify Python implementation code before a failing test exists for the change.
+Do not add or change behavior in Python code before a failing test exists for that change. Behavior-preserving refactors (step 3) are the exception — no new test required, but the existing suite must stay green.
 
 ## Package Management
 
@@ -68,7 +68,7 @@ The test suite uses mocked proxy client and LLM responses - no credentials requi
 
 - `GET /health` - Health check
 - `GET /labels` - List available Gmail labels with message counts
-- `POST /search` - Search emails with structured filters (returns from_name, to, cc, thread_id, has_attachments, and RFC 2822 message_id/references for reply threading)
+- `POST /search` - Search emails with structured filters (returns from_name, to/cc/bcc lists, thread_id, has_attachments, and RFC 2822 rfc822_message_id/in_reply_to/references for reply threading)
 - `POST /summarize` - Summarize an email (uses local LLM)
 - `POST /ask-about` - Ask a question about an email (uses local LLM)
 - `POST /mark-read` - Mark email as read

@@ -19,7 +19,7 @@ import httpx
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 
-from gmail_utils import get_header, decode_body
+from gmail_utils import get_header, decode_body, parse_address_list, parse_references
 from message_builder import build_rfc2822
 from proxy_client import (
     get_gmail_client,
@@ -87,19 +87,21 @@ class SearchRequest(BaseModel):
 
 
 class MessageSummary(BaseModel):
-    id: str
-    thread_id: str
+    id: str = Field(..., description="Gmail API message ID (use with /summarize, /ask-about, etc.)")
+    thread_id: str = Field(..., description="Gmail API thread ID (use with /drafts/create thread_id for replies)")
     date: str
     from_addr: str
     from_name: str
-    to: str
-    cc: str
+    to: list[str]
+    cc: list[str]
+    bcc: list[str]
     subject: str
     snippet: str
     labels: list[str]
     has_attachments: bool
-    message_id: str = Field("", description="RFC 2822 Message-ID header (for reply threading)")
-    references: list[str] = Field(default_factory=list, description="RFC 2822 References Message-IDs")
+    rfc822_message_id: str = Field(..., description="RFC 2822 Message-ID header (for reply threading)")
+    in_reply_to: str = Field(..., description="RFC 2822 In-Reply-To header of this message")
+    references: list[str] = Field(..., description="RFC 2822 References Message-IDs of this message")
 
 
 class SearchResponse(BaseModel):
@@ -229,6 +231,7 @@ class DraftRequest(BaseModel):
     bcc: Optional[list[str]] = Field(None, description="BCC recipients")
     in_reply_to: Optional[str] = Field(None, description="Message-ID to reply to (for threading)")
     references: Optional[list[str]] = Field(None, description="Thread Message-IDs (for threading)")
+    thread_id: Optional[str] = Field(None, description="Gmail thread ID to attach the draft to (from /search thread_id, for replies)")
 
 
 class DraftResponse(BaseModel):
@@ -509,21 +512,22 @@ async def search(request: SearchRequest):
             payload = msg.get("payload", {})
             headers = payload.get("headers", [])
             from_addr = get_header(headers, "From")
-            references_header = get_header(headers, "References")
             messages.append(MessageSummary(
                 id=msg["id"],
                 thread_id=msg.get("threadId", ""),
                 date=get_header(headers, "Date"),
                 from_addr=from_addr,
                 from_name=parse_sender_name(from_addr),
-                to=get_header(headers, "To"),
-                cc=get_header(headers, "Cc"),
+                to=parse_address_list(get_header(headers, "To")),
+                cc=parse_address_list(get_header(headers, "Cc")),
+                bcc=parse_address_list(get_header(headers, "Bcc")),
                 subject=get_header(headers, "Subject"),
                 snippet=msg.get("snippet", ""),
                 labels=msg.get("labelIds", []),
                 has_attachments=has_attachments(payload),
-                message_id=get_header(headers, "Message-ID"),
-                references=references_header.split() if references_header else [],
+                rfc822_message_id=get_header(headers, "Message-ID"),
+                in_reply_to=get_header(headers, "In-Reply-To"),
+                references=parse_references(get_header(headers, "References")),
             ))
 
         return SearchResponse(success=True, messages=messages, error=None)
@@ -765,7 +769,7 @@ async def create_draft(request: DraftRequest):
         )
 
         client = get_gmail_client()
-        result = await client.create_draft(raw_message)
+        result = await client.create_draft(raw_message, thread_id=request.thread_id)
 
         draft_id = result.get("id")
         return DraftResponse(
@@ -798,13 +802,10 @@ async def list_drafts():
             payload = message.get("payload", {})
             headers = payload.get("headers", [])
 
-            to_header = get_header(headers, "To")
-            subject = get_header(headers, "Subject")
-
             drafts.append(DraftSummary(
                 id=draft["id"],
-                to=[addr.strip() for addr in to_header.split(",")] if to_header else [],
-                subject=subject,
+                to=parse_address_list(get_header(headers, "To")),
+                subject=get_header(headers, "Subject"),
                 snippet=message.get("snippet", ""),
             ))
 
@@ -828,20 +829,14 @@ async def get_draft(draft_id: str):
         payload = message.get("payload", {})
         headers = payload.get("headers", [])
 
-        to_raw = get_header(headers, "To")
-        to = [addr.strip() for addr in to_raw.split(",")] if to_raw else []
-
-        cc_raw = get_header(headers, "Cc")
-        cc = [addr.strip() for addr in cc_raw.split(",")] if cc_raw else None
-
-        bcc_raw = get_header(headers, "Bcc")
-        bcc = [addr.strip() for addr in bcc_raw.split(",")] if bcc_raw else None
+        to = parse_address_list(get_header(headers, "To"))
+        cc = parse_address_list(get_header(headers, "Cc")) or None
+        bcc = parse_address_list(get_header(headers, "Bcc")) or None
 
         subject = get_header(headers, "Subject")
 
         in_reply_to = get_header(headers, "In-Reply-To") or None
-        references_header = get_header(headers, "References")
-        references = references_header.split() if references_header else None
+        references = parse_references(get_header(headers, "References")) or None
 
         body = decode_body(payload)
 
@@ -880,7 +875,7 @@ async def update_draft(draft_id: str, request: DraftRequest):
         )
 
         client = get_gmail_client()
-        await client.update_draft(draft_id, raw_message)
+        await client.update_draft(draft_id, raw_message, thread_id=request.thread_id)
 
         return DraftResponse(
             success=True,

@@ -5,6 +5,46 @@ They have no framework or authentication dependencies.
 """
 
 import base64
+import re
+from email.utils import formataddr, getaddresses
+
+# Angle-bracketed Message-IDs, e.g. "<abc@example.com>"
+_MESSAGE_ID_PATTERN = re.compile(r"<[^<>]+>")
+
+
+def parse_references(header_value: str) -> list[str]:
+    """Extract Message-IDs from a References (or In-Reply-To) header value.
+
+    Tolerates the separator variations found in real mail: whitespace,
+    commas, CFWS comments, folding remnants, and adjacent angle-bracket
+    ids with no separator at all.
+
+    Args:
+        header_value: Raw header value (may be empty)
+
+    Returns:
+        List of angle-bracketed Message-IDs, in order
+    """
+    if not header_value:
+        return []
+    return _MESSAGE_ID_PATTERN.findall(header_value)
+
+
+def parse_address_list(header_value: str) -> list[str]:
+    """Split an address header (To/Cc/Bcc) into individual addresses.
+
+    Uses RFC 2822-aware parsing so display names containing commas
+    (e.g. '"Doe, John" <j@x.com>') stay intact.
+
+    Args:
+        header_value: Raw header value (may be empty)
+
+    Returns:
+        List of formatted addresses, e.g. ['Jane <jane@x.com>', 'b@y.com']
+    """
+    if not header_value:
+        return []
+    return [formataddr(pair) for pair in getaddresses([header_value]) if pair[0] or pair[1]]
 
 
 def get_header(headers: list, name: str) -> str:
