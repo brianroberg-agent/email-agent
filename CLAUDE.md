@@ -8,6 +8,16 @@ This is an email agent server - a privacy-focused FastAPI wrapper around the Gma
 
 The server communicates with Gmail through an API proxy that handles Google OAuth authentication and human-in-the-loop controls. The agent authenticates with the proxy using an API key.
 
+## Development Workflow
+
+Use red/green TDD whenever editing Python code:
+
+1. **Red**: Write a failing test first that captures the desired behavior. Run it and confirm it fails for the expected reason.
+2. **Green**: Write the minimal implementation that makes the test pass. Run the test suite and confirm it passes.
+3. Refactor if needed, keeping tests green.
+
+Do not write or modify Python implementation code before a failing test exists for the change.
+
 ## Package Management
 
 Use `uv` for package management. Dependencies are defined in `pyproject.toml`.
