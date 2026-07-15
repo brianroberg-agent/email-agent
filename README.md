@@ -55,6 +55,7 @@ No separate install step needed. The `uv run` command automatically manages depe
 | `PROXY_URL` | No | `http://host.docker.internal:8000` | URL of the proxy server |
 | `MLX_URL` | No | `http://localhost:8080/v1/chat/completions` | Local LLM endpoint |
 | `MLX_MODEL` | No | `qwen/qwen3-14b` | Model name for LLM requests |
+| `LLM_MAX_TOKENS` | No | `4096` | Token budget per LLM completion (reasoning + answer) |
 
 ## Usage
 
@@ -186,9 +187,12 @@ Response:
 {
   "success": true,
   "answer": "The sender is thanking you for the conversation and mentions being available next month.",
+  "degraded": false,
   "error": null
 }
 ```
+
+`degraded: true` means the answer is usable but suspect: either it was salvaged from the model's reasoning trace because the LLM server returned an empty completion with a clean finish (the text is raw chain-of-thought, not a polished answer), or the completion was cut off by the token budget (`finish_reason=length`) and is incomplete. Treat it with caution either way.
 
 ### POST /ask-about
 
@@ -205,6 +209,7 @@ Response:
 {
   "success": true,
   "answer": "No, the sender did not mention a specific deadline.",
+  "degraded": false,
   "error": null
 }
 ```
@@ -275,6 +280,7 @@ Response:
       "summary": "John is requesting a review of the Q4 report by Friday.",
       "detected_action": "review_requested",
       "detected_deadline": "2026-02-01",
+      "degraded": false,
       "error": null
     },
     {
@@ -283,6 +289,7 @@ Response:
       "summary": "Weekly newsletter with company updates.",
       "detected_action": "info_only",
       "detected_deadline": null,
+      "degraded": false,
       "error": null
     }
   ],

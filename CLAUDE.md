@@ -90,6 +90,7 @@ Copy `.env.example` to `.env` and configure:
 - `PROXY_URL` - URL of the proxy server (default: `http://host.docker.internal:8000`)
 - `MLX_URL` - Local LLM endpoint (default: `http://localhost:8080/v1/chat/completions`)
 - `MLX_MODEL` - Model name (default: `qwen/qwen3-14b`)
+- `LLM_MAX_TOKENS` - Token budget per LLM completion, reasoning + answer (default: `4096`)
 
 ## Proxy Server
 
