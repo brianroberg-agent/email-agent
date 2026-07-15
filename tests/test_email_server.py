@@ -361,7 +361,6 @@ class TestSummarizeEndpoint:
     @patch("email_server.get_gmail_client")
     def test_summarize_surfaces_degraded_flag(self, mock_get_client, mock_llm, client):
         """A reasoning-fallback answer is flagged so callers can treat it with caution."""
-        from email_server import LLMResult
         mock_proxy_client = AsyncMock()
         mock_get_client.return_value = mock_proxy_client
         mock_proxy_client.get_message.return_value = SAMPLE_MESSAGES["with_body"]
@@ -481,7 +480,6 @@ class TestAskAboutEndpoint:
     @patch("email_server.call_local_llm", new_callable=AsyncMock)
     @patch("email_server.get_gmail_client")
     def test_ask_about_surfaces_degraded_flag(self, mock_get_client, mock_llm, client):
-        from email_server import LLMResult
         mock_proxy_client = AsyncMock()
         mock_get_client.return_value = mock_proxy_client
         mock_proxy_client.get_message.return_value = SAMPLE_MESSAGES["with_body"]
@@ -964,17 +962,21 @@ class TestCallLocalLLM:
             assert "cold-loading" in msg
 
     @pytest.mark.asyncio
-    async def test_call_local_llm_raises_http_error_on_4xx(self):
+    @pytest.mark.parametrize("status_code,body", [
+        (404, "Not Found: no such model"),
+        (503, "Service Unavailable: model loading"),
+    ])
+    async def test_call_local_llm_raises_http_error_on_error_status(self, status_code, body):
         import httpx
         from unittest.mock import MagicMock
         from email_server import call_local_llm, LLMHTTPError
 
         mock_response = MagicMock()
-        mock_response.status_code = 503
-        mock_response.text = "Service Unavailable: model loading"
+        mock_response.status_code = status_code
+        mock_response.text = body
         mock_response.raise_for_status = MagicMock(
             side_effect=httpx.HTTPStatusError(
-                "503", request=MagicMock(), response=mock_response
+                str(status_code), request=MagicMock(), response=mock_response
             )
         )
 
@@ -985,8 +987,8 @@ class TestCallLocalLLM:
             with pytest.raises(LLMHTTPError) as exc_info:
                 await call_local_llm("System prompt", "User content")
             msg = str(exc_info.value)
-            assert "HTTP 503" in msg
-            assert "Service Unavailable: model loading" in msg
+            assert f"HTTP {status_code}" in msg
+            assert body in msg
             assert "/v1/models" in msg
 
     @pytest.mark.asyncio
@@ -1159,6 +1161,195 @@ class TestCallLocalLLM:
             assert "not salvaged" in msg
             assert "truncated" not in msg
 
+    @pytest.mark.asyncio
+    async def test_call_local_llm_strips_reasoning_before_bare_close_tag(self):
+        """Chat templates that pre-fill the opening <think> token produce
+        content shaped like 'reasoning...</think>answer' with no opening tag;
+        the reasoning prefix must not leak out as part of the answer."""
+        import httpx
+        from unittest.mock import MagicMock
+        from email_server import call_local_llm
+
+        mock_response = MagicMock()
+        mock_response.json.return_value = {
+            "choices": [
+                {
+                    "message": {
+                        "content": (
+                            "Okay, the user wants a summary of this email."
+                            "</think>\nThe sender asks for a review."
+                        )
+                    },
+                    "finish_reason": "stop",
+                }
+            ]
+        }
+        mock_response.raise_for_status = MagicMock()
+
+        with patch.object(
+            httpx.AsyncClient, "post", new_callable=AsyncMock
+        ) as mock_post:
+            mock_post.return_value = mock_response
+            result = await call_local_llm("System prompt", "User content")
+            assert result.text == "The sender asks for a review."
+            assert result.degraded is False
+
+    @pytest.mark.asyncio
+    async def test_call_local_llm_marks_length_truncated_answer_degraded(self):
+        """An answer cut off by the token budget is usable but incomplete —
+        it must carry degraded=True, not read as a full-confidence success."""
+        import httpx
+        from unittest.mock import MagicMock
+        from email_server import call_local_llm
+
+        mock_response = MagicMock()
+        mock_response.json.return_value = {
+            "choices": [
+                {
+                    "message": {
+                        "content": "<think>Reasoning.</think>The sender is asking you to"
+                    },
+                    "finish_reason": "length",
+                }
+            ]
+        }
+        mock_response.raise_for_status = MagicMock()
+
+        with patch.object(
+            httpx.AsyncClient, "post", new_callable=AsyncMock
+        ) as mock_post:
+            mock_post.return_value = mock_response
+            result = await call_local_llm("System prompt", "User content")
+            assert result.text == "The sender is asking you to"
+            assert result.degraded is True
+
+    @pytest.mark.asyncio
+    async def test_call_local_llm_salvages_reasoning_wrapped_in_think_tags(self):
+        """Backends that keep <think> markers in reasoning_content must not
+        have the salvage text wiped by block-stripping — only the markers go."""
+        import httpx
+        from unittest.mock import MagicMock
+        from email_server import call_local_llm
+
+        mock_response = MagicMock()
+        mock_response.json.return_value = {
+            "choices": [
+                {
+                    "message": {
+                        "content": "",
+                        "reasoning_content": (
+                            "<think>The email is from HR about the deadline.</think>"
+                        ),
+                    },
+                    "finish_reason": "stop",
+                }
+            ]
+        }
+        mock_response.raise_for_status = MagicMock()
+
+        with patch.object(
+            httpx.AsyncClient, "post", new_callable=AsyncMock
+        ) as mock_post:
+            mock_post.return_value = mock_response
+            result = await call_local_llm("System prompt", "User content")
+            assert result.text == "The email is from HR about the deadline."
+            assert result.degraded is True
+
+    @pytest.mark.asyncio
+    async def test_call_local_llm_raises_unreachable_on_connect_timeout(self):
+        """A dead or black-holing host times out during connect — that is an
+        unreachable-host problem and must show the reachability diagnostic,
+        not the cold-loading retry advice."""
+        import httpx
+        from email_server import call_local_llm, LLMUnreachableError
+
+        with patch.object(
+            httpx.AsyncClient, "post", new_callable=AsyncMock
+        ) as mock_post:
+            mock_post.side_effect = httpx.ConnectTimeout("timed out")
+            with pytest.raises(LLMUnreachableError) as exc_info:
+                await call_local_llm("System prompt", "User content")
+            msg = str(exc_info.value)
+            assert "Cannot reach MLX server at" in msg
+            assert "tailscale ping" in msg
+
+    @pytest.mark.asyncio
+    async def test_call_local_llm_raises_timeout_on_write_timeout(self):
+        import httpx
+        from email_server import call_local_llm, LLMTimeoutError
+
+        with patch.object(
+            httpx.AsyncClient, "post", new_callable=AsyncMock
+        ) as mock_post:
+            mock_post.side_effect = httpx.WriteTimeout("write timed out")
+            with pytest.raises(LLMTimeoutError) as exc_info:
+                await call_local_llm("System prompt", "User content")
+            assert "did not respond within" in str(exc_info.value)
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "exc_name", ["ReadError", "WriteError", "RemoteProtocolError"]
+    )
+    async def test_call_local_llm_wraps_mid_request_transport_errors(self, exc_name):
+        """A crash mid-request (LM Studio dying, connection drop) must surface
+        as an actionable LLM error, not a bare httpx exception name."""
+        import httpx
+        from email_server import call_local_llm, LLMUnreachableError
+
+        with patch.object(
+            httpx.AsyncClient, "post", new_callable=AsyncMock
+        ) as mock_post:
+            mock_post.side_effect = getattr(httpx, exc_name)("connection broke")
+            with pytest.raises(LLMUnreachableError) as exc_info:
+                await call_local_llm("System prompt", "User content")
+            msg = str(exc_info.value)
+            assert "failed mid-request" in msg
+            assert exc_name in msg
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "body", [{"error": {"message": "oops"}}, {"choices": []}]
+    )
+    async def test_call_local_llm_raises_malformed_on_unexpected_200_body(self, body):
+        """A 200 whose body is not an OpenAI-style completion must raise a
+        classified LLM error, not leak KeyError/IndexError to the caller."""
+        import httpx
+        import json as jsonlib
+        from unittest.mock import MagicMock
+        from email_server import call_local_llm, LLMMalformedResponseError
+
+        mock_response = MagicMock()
+        mock_response.json.return_value = body
+        mock_response.text = jsonlib.dumps(body)
+        mock_response.raise_for_status = MagicMock()
+
+        with patch.object(
+            httpx.AsyncClient, "post", new_callable=AsyncMock
+        ) as mock_post:
+            mock_post.return_value = mock_response
+            with pytest.raises(LLMMalformedResponseError) as exc_info:
+                await call_local_llm("System prompt", "User content")
+            assert "unexpected" in str(exc_info.value)
+
+    @pytest.mark.asyncio
+    async def test_call_local_llm_raises_malformed_on_non_json_200_body(self):
+        import httpx
+        from unittest.mock import MagicMock
+        from email_server import call_local_llm, LLMMalformedResponseError
+
+        mock_response = MagicMock()
+        mock_response.json.side_effect = ValueError("Expecting value")
+        mock_response.text = "<html>gateway error</html>"
+        mock_response.raise_for_status = MagicMock()
+
+        with patch.object(
+            httpx.AsyncClient, "post", new_callable=AsyncMock
+        ) as mock_post:
+            mock_post.return_value = mock_response
+            with pytest.raises(LLMMalformedResponseError) as exc_info:
+                await call_local_llm("System prompt", "User content")
+            assert "gateway error" in str(exc_info.value)
+
 
 class TestFormatProxyError:
     """Tests for format_proxy_error dispatch."""
@@ -1170,12 +1361,14 @@ class TestFormatProxyError:
             LLMTimeoutError,
             LLMHTTPError,
             LLMEmptyResponseError,
+            LLMMalformedResponseError,
         )
         for cls in (
             LLMUnreachableError,
             LLMTimeoutError,
             LLMHTTPError,
             LLMEmptyResponseError,
+            LLMMalformedResponseError,
         ):
             err = cls("something went wrong")
             formatted = format_proxy_error(err)
@@ -1193,6 +1386,61 @@ class TestFormatProxyError:
 
         formatted = format_proxy_error(BlankException())
         assert formatted == "BlankException"
+
+    def test_format_proxy_error_generic_exception_includes_type_name(self):
+        """Unrecognized exceptions are formatted as 'TypeName: message' so
+        callers can tell what failed without a Python traceback."""
+        from email_server import format_proxy_error
+
+        assert format_proxy_error(ValueError("boom")) == "ValueError: boom"
+
+
+class TestLLMConfig:
+    """Tests for LLM configuration loading."""
+
+    def test_llm_max_tokens_configurable_via_env(self, monkeypatch):
+        """The empty-completion error tells operators to increase
+        LLM_MAX_TOKENS, so it must actually be settable from the environment."""
+        import importlib
+        import email_server
+
+        monkeypatch.setenv("LLM_MAX_TOKENS", "1234")
+        try:
+            importlib.reload(email_server)
+            assert email_server.LLM_MAX_TOKENS == 1234
+        finally:
+            monkeypatch.delenv("LLM_MAX_TOKENS", raising=False)
+            importlib.reload(email_server)
+
+
+class TestStartupBanner:
+    """Tests for the config banner timing."""
+
+    def test_import_does_not_print_banner(self):
+        """Importing the module (pytest, tooling) must not emit the banner."""
+        import subprocess
+        import sys
+        from pathlib import Path
+
+        result = subprocess.run(
+            [sys.executable, "-c", "import email_server"],
+            capture_output=True,
+            text=True,
+            cwd=Path(__file__).resolve().parents[1],
+        )
+        assert result.returncode == 0, result.stderr
+        assert "email-agent: MLX_URL=" not in result.stderr
+
+    def test_banner_printed_on_server_startup(self, capfd):
+        """The banner is emitted once, when the server actually starts."""
+        from fastapi.testclient import TestClient
+        import email_server
+
+        with TestClient(email_server.app):
+            pass
+
+        captured = capfd.readouterr()
+        assert "email-agent: MLX_URL=" in captured.err
 
 
 class TestRequestValidation:
@@ -1256,7 +1504,6 @@ class TestBatchSummarizeEndpoint:
     @patch("email_server.call_local_llm", new_callable=AsyncMock)
     @patch("email_server.get_gmail_client")
     def test_batch_summarize_surfaces_degraded_flag(self, mock_get_client, mock_llm, client):
-        from email_server import LLMResult
         mock_proxy_client = AsyncMock()
         mock_get_client.return_value = mock_proxy_client
         mock_proxy_client.get_message.return_value = SAMPLE_MESSAGES["with_body"]
@@ -1273,6 +1520,25 @@ class TestBatchSummarizeEndpoint:
         assert result["success"] is True
         assert result["summary"] == "Salvaged"
         assert result["degraded"] is True
+
+    @patch("email_server.call_local_llm", new_callable=AsyncMock)
+    @patch("email_server.get_gmail_client")
+    def test_batch_summarize_non_object_json_falls_back_to_raw_summary(self, mock_get_client, mock_llm, client):
+        """Valid JSON that is not an object (e.g. a bare string) must use the
+        raw-response fallback, not crash with AttributeError."""
+        mock_proxy_client = AsyncMock()
+        mock_get_client.return_value = mock_proxy_client
+        mock_proxy_client.get_message.return_value = SAMPLE_MESSAGES["with_body"]
+
+        mock_llm.return_value = LLMResult('"Review the Q4 report by Friday"')
+
+        response = client.post("/batch-summarize", json={"message_ids": ["msg123"]})
+        data = response.json()
+
+        result = data["results"][0]
+        assert result["success"] is True
+        assert result["summary"] == '"Review the Q4 report by Friday"'
+        assert result["detected_action"] is None
 
     @patch("email_server.call_local_llm", new_callable=AsyncMock)
     @patch("email_server.get_gmail_client")

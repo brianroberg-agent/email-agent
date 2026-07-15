@@ -55,6 +55,7 @@ No separate install step needed. The `uv run` command automatically manages depe
 | `PROXY_URL` | No | `http://host.docker.internal:8000` | URL of the proxy server |
 | `MLX_URL` | No | `http://localhost:8080/v1/chat/completions` | Local LLM endpoint |
 | `MLX_MODEL` | No | `qwen/qwen3-14b` | Model name for LLM requests |
+| `LLM_MAX_TOKENS` | No | `4096` | Token budget per LLM completion (reasoning + answer) |
 
 ## Usage
 
@@ -191,7 +192,7 @@ Response:
 }
 ```
 
-`degraded: true` means the answer was salvaged from the model's reasoning trace because the LLM server returned an empty completion with a clean finish — the text is raw chain-of-thought, not a polished answer, and should be treated with caution.
+`degraded: true` means the answer is usable but suspect: either it was salvaged from the model's reasoning trace because the LLM server returned an empty completion with a clean finish (the text is raw chain-of-thought, not a polished answer), or the completion was cut off by the token budget (`finish_reason=length`) and is incomplete. Treat it with caution either way.
 
 ### POST /ask-about
 
