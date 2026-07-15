@@ -891,6 +891,151 @@ class TestCallLocalLLM:
             result = await call_local_llm("System prompt", "User content")
             assert result == "Simple response without thinking"
 
+    @pytest.mark.asyncio
+    async def test_call_local_llm_raises_unreachable_on_connect_error(self):
+        import httpx
+        from email_server import call_local_llm, LLMUnreachableError
+
+        with patch.object(
+            httpx.AsyncClient, "post", new_callable=AsyncMock
+        ) as mock_post:
+            mock_post.side_effect = httpx.ConnectError("All connection attempts failed")
+            with pytest.raises(LLMUnreachableError) as exc_info:
+                await call_local_llm("System prompt", "User content")
+            msg = str(exc_info.value)
+            assert "Cannot reach MLX server at" in msg
+            assert "LM Studio" in msg
+            assert "All connection attempts failed" in msg
+
+    @pytest.mark.asyncio
+    async def test_call_local_llm_raises_timeout_on_read_timeout(self):
+        import httpx
+        from email_server import call_local_llm, LLMTimeoutError
+
+        with patch.object(
+            httpx.AsyncClient, "post", new_callable=AsyncMock
+        ) as mock_post:
+            mock_post.side_effect = httpx.ReadTimeout("read timed out")
+            with pytest.raises(LLMTimeoutError) as exc_info:
+                await call_local_llm("System prompt", "User content")
+            msg = str(exc_info.value)
+            assert "did not respond within" in msg
+            assert "cold-loading" in msg
+
+    @pytest.mark.asyncio
+    async def test_call_local_llm_raises_http_error_on_4xx(self):
+        import httpx
+        from unittest.mock import MagicMock
+        from email_server import call_local_llm, LLMHTTPError
+
+        mock_response = MagicMock()
+        mock_response.status_code = 503
+        mock_response.text = "Service Unavailable: model loading"
+        mock_response.raise_for_status = MagicMock(
+            side_effect=httpx.HTTPStatusError(
+                "503", request=MagicMock(), response=mock_response
+            )
+        )
+
+        with patch.object(
+            httpx.AsyncClient, "post", new_callable=AsyncMock
+        ) as mock_post:
+            mock_post.return_value = mock_response
+            with pytest.raises(LLMHTTPError) as exc_info:
+                await call_local_llm("System prompt", "User content")
+            msg = str(exc_info.value)
+            assert "HTTP 503" in msg
+            assert "Service Unavailable: model loading" in msg
+            assert "/v1/models" in msg
+
+    @pytest.mark.asyncio
+    async def test_call_local_llm_raises_empty_response_when_no_content_or_reasoning(self):
+        import httpx
+        from unittest.mock import MagicMock
+        from email_server import call_local_llm, LLMEmptyResponseError
+
+        mock_response = MagicMock()
+        mock_response.json.return_value = {
+            "choices": [{"message": {"content": ""}, "finish_reason": "length"}]
+        }
+        mock_response.raise_for_status = MagicMock()
+
+        with patch.object(
+            httpx.AsyncClient, "post", new_callable=AsyncMock
+        ) as mock_post:
+            mock_post.return_value = mock_response
+            with pytest.raises(LLMEmptyResponseError) as exc_info:
+                await call_local_llm("System prompt", "User content")
+            msg = str(exc_info.value)
+            assert "empty completion" in msg
+            assert "finish_reason=length" in msg
+            assert "max_tokens" in msg
+
+    @pytest.mark.asyncio
+    async def test_call_local_llm_falls_back_to_reasoning_content_when_content_empty(self, capsys):
+        import httpx
+        from unittest.mock import MagicMock
+        from email_server import call_local_llm
+
+        mock_response = MagicMock()
+        mock_response.json.return_value = {
+            "choices": [
+                {
+                    "message": {
+                        "content": "",
+                        "reasoning_content": "I think the answer is 42.",
+                    },
+                    "finish_reason": "stop",
+                }
+            ]
+        }
+        mock_response.raise_for_status = MagicMock()
+
+        with patch.object(
+            httpx.AsyncClient, "post", new_callable=AsyncMock
+        ) as mock_post:
+            mock_post.return_value = mock_response
+            result = await call_local_llm("System prompt", "User content")
+            assert result == "I think the answer is 42."
+            captured = capsys.readouterr()
+            assert "WARN" in captured.err
+            assert "reasoning_content fallback" in captured.err
+
+
+class TestFormatProxyError:
+    """Tests for format_proxy_error dispatch."""
+
+    def test_format_proxy_error_prefixes_llm_errors(self):
+        from email_server import (
+            format_proxy_error,
+            LLMUnreachableError,
+            LLMTimeoutError,
+            LLMHTTPError,
+            LLMEmptyResponseError,
+        )
+        for cls in (
+            LLMUnreachableError,
+            LLMTimeoutError,
+            LLMHTTPError,
+            LLMEmptyResponseError,
+        ):
+            err = cls("something went wrong")
+            formatted = format_proxy_error(err)
+            assert formatted.startswith("LLM error: ")
+            assert "something went wrong" in formatted
+
+    def test_format_proxy_error_handles_empty_str_exceptions(self):
+        """Catch-all should never return a bare empty string (httpx.ReadTimeout
+        bug we hit pre-fix: str(ReadTimeout()) == '')."""
+        from email_server import format_proxy_error
+
+        class BlankException(Exception):
+            def __str__(self):
+                return ""
+
+        formatted = format_proxy_error(BlankException())
+        assert formatted == "BlankException"
+
 
 class TestRequestValidation:
     """Tests for request validation."""

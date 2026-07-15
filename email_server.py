@@ -12,6 +12,7 @@ Google OAuth authentication and human-in-the-loop controls.
 import json
 import os
 import re
+import sys
 from enum import Enum
 from typing import Optional
 
@@ -33,9 +34,38 @@ app = FastAPI(title="Email Agent Server v2", version="2.0")
 # LLM configuration
 MLX_URL = os.environ.get("MLX_URL", "http://localhost:8080/v1/chat/completions")
 MLX_MODEL = os.environ.get("MLX_MODEL", "qwen/qwen3-14b")
+LLM_TIMEOUT_SECONDS = 120.0
+LLM_MAX_TOKENS = 4096
 
 # Qwen3 wraps chain-of-thought in <think> tags - strip them from output
 THINKING_PATTERN = re.compile(r"<think>.*?</think>\s*", re.DOTALL)
+
+print(
+    f"email-agent: MLX_URL={MLX_URL} MLX_MODEL={MLX_MODEL} "
+    f"timeout={LLM_TIMEOUT_SECONDS}s max_tokens={LLM_MAX_TOKENS}",
+    file=sys.stderr,
+    flush=True,
+)
+
+
+class LLMError(Exception):
+    """Base class for local LLM (MLX) errors. Messages are already actionable."""
+
+
+class LLMUnreachableError(LLMError):
+    pass
+
+
+class LLMTimeoutError(LLMError):
+    pass
+
+
+class LLMHTTPError(LLMError):
+    pass
+
+
+class LLMEmptyResponseError(LLMError):
+    pass
 
 # System prompts for LLM
 SUMMARIZE_SYSTEM_PROMPT = """You are summarizing an email for a busy professional. Provide a concise 2-3 sentence summary.
@@ -277,23 +307,69 @@ async def call_local_llm(system_prompt: str, user_content: str) -> str:
     Returns:
         LLM response with thinking tags stripped
     """
-    async with httpx.AsyncClient(timeout=120.0) as client:
-        response = await client.post(
-            MLX_URL,
-            json={
-                "model": MLX_MODEL,
-                "messages": [
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": user_content},
-                ],
-                "max_tokens": 512,
-                "temperature": 0.3,
-            },
-        )
+    payload = {
+        "model": MLX_MODEL,
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_content},
+        ],
+        # Qwen3 reasoning models spend hundreds of tokens on chain-of-thought
+        # before emitting any `content`; budget generously so reasoning and
+        # answer both fit.
+        "max_tokens": LLM_MAX_TOKENS,
+        "temperature": 0.3,
+    }
+    try:
+        async with httpx.AsyncClient(timeout=LLM_TIMEOUT_SECONDS) as client:
+            response = await client.post(MLX_URL, json=payload)
+    except httpx.ConnectError as e:
+        raise LLMUnreachableError(
+            f"Cannot reach MLX server at {MLX_URL}. Check that LM Studio is "
+            f"running and the host is reachable on Tailscale "
+            f"(try `tailscale ping <host>` from this machine). "
+            f"Underlying httpx error: {e!s}"
+        ) from e
+    except (httpx.ConnectTimeout, httpx.ReadTimeout, httpx.PoolTimeout) as e:
+        raise LLMTimeoutError(
+            f"MLX server at {MLX_URL} did not respond within "
+            f"{LLM_TIMEOUT_SECONDS:.0f}s. The model may be cold-loading on "
+            f"first use; retry, or check LM Studio logs on the host."
+        ) from e
+
+    try:
         response.raise_for_status()
-        data = response.json()
-        text = data["choices"][0]["message"]["content"]
-        return THINKING_PATTERN.sub("", text).strip()
+    except httpx.HTTPStatusError as e:
+        body_preview = e.response.text[:200].replace("\n", " ")
+        raise LLMHTTPError(
+            f"MLX server at {MLX_URL} returned HTTP {e.response.status_code}. "
+            f"Body: {body_preview!r}. "
+            f"Common causes: model {MLX_MODEL!r} not loaded in LM Studio "
+            f"(check /v1/models), or the server is still loading."
+        ) from e
+
+    data = response.json()
+    message = data["choices"][0]["message"]
+    finish_reason = data["choices"][0].get("finish_reason")
+    text = (message.get("content") or "").strip()
+    if not text:
+        reasoning = (message.get("reasoning_content") or "").strip()
+        if reasoning:
+            print(
+                "WARN: MLX returned empty content; using reasoning_content "
+                f"fallback (finish_reason={finish_reason})",
+                file=sys.stderr,
+                flush=True,
+            )
+            text = reasoning
+        else:
+            raise LLMEmptyResponseError(
+                f"MLX returned empty completion "
+                f"(finish_reason={finish_reason}, model={MLX_MODEL}). "
+                f"If finish_reason='length', max_tokens ({LLM_MAX_TOKENS}) "
+                f"may be too low for this reasoning model — increase "
+                f"LLM_MAX_TOKENS or switch to a non-reasoning model."
+            )
+    return THINKING_PATTERN.sub("", text).strip()
 
 
 def build_gmail_query(request: SearchRequest) -> str:
@@ -375,14 +451,17 @@ def has_attachments(payload: dict) -> bool:
 
 
 def format_proxy_error(e: Exception) -> str:
-    """Format a proxy error for user-friendly display."""
+    """Format a proxy or LLM error for user-friendly display."""
+    if isinstance(e, LLMError):
+        # LLM errors already carry an actionable message; just label the source.
+        return f"LLM error: {e}"
     if isinstance(e, ProxyAuthError):
         return f"Authentication error: {e}"
     if isinstance(e, ProxyForbiddenError):
         return f"Operation blocked: {e}"
     if isinstance(e, ProxyError):
         return f"Proxy error: {e}"
-    return str(e)
+    return f"{type(e).__name__}: {e}" if str(e) else type(e).__name__
 
 
 async def resolve_label_id(client, label_name: str) -> str:
