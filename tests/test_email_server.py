@@ -276,6 +276,46 @@ class TestSearchEndpoint:
         assert "UNREAD" in msg["labels"]
         assert msg["has_attachments"] is False
 
+    @staticmethod
+    def _search_single(mock_get_client, client, sample_key):
+        """Run /search against a single mocked message and return its stub."""
+        mock_proxy_client = AsyncMock()
+        mock_get_client.return_value = mock_proxy_client
+        sample = SAMPLE_MESSAGES[sample_key]
+        mock_proxy_client.list_messages.return_value = {
+            "messages": [{"id": sample["id"], "threadId": sample["threadId"]}]
+        }
+        mock_proxy_client.get_message.return_value = sample
+
+        response = client.post("/search", json={"limit": 1})
+        assert response.status_code == 200
+        return response.json()["messages"][0]
+
+    @patch("email_server.get_gmail_client")
+    def test_search_returns_recipient_and_threading_fields(self, mock_get_client, client):
+        """Stubs expose recipients and RFC 2822 threading headers (issue #2)."""
+        msg = self._search_single(mock_get_client, client, "sent_reply")
+
+        assert msg["to"] == ["Jane Colleague <jane@example.com>"]
+        assert msg["cc"] == ["team@example.com"]
+        assert msg["bcc"] == ["hidden@example.com"]
+        assert msg["thread_id"] == "thread_reply"
+        assert msg["rfc822_message_id"] == "<reply-abc@mail.gmail.com>"
+        assert msg["in_reply_to"] == "<mid-456@example.com>"
+        assert msg["references"] == ["<orig-123@example.com>", "<mid-456@example.com>"]
+
+    @patch("email_server.get_gmail_client")
+    def test_search_header_fields_default_when_absent(self, mock_get_client, client):
+        """Messages without recipient/threading headers get empty defaults."""
+        msg = self._search_single(mock_get_client, client, "basic")
+
+        assert msg["to"] == []
+        assert msg["cc"] == []
+        assert msg["bcc"] == []
+        assert msg["rfc822_message_id"] == ""
+        assert msg["in_reply_to"] == ""
+        assert msg["references"] == []
+
     @patch("email_server.get_gmail_client")
     @pytest.mark.parametrize("error_message", [
         "Gmail API error",
@@ -715,6 +755,35 @@ class TestGmailUtils:
         from gmail_utils import decode_body
         payload = {"body": {}}
         assert decode_body(payload) == "(Could not extract text content)"
+
+    @pytest.mark.parametrize("header_value,expected", [
+        ("", []),
+        ("<a@x.com>", ["<a@x.com>"]),
+        ("<a@x.com> <b@y.com>", ["<a@x.com>", "<b@y.com>"]),
+        # Adjacent ids with no separator (emitted by some mailers)
+        ("<a@x.com><b@y.com>", ["<a@x.com>", "<b@y.com>"]),
+        # CFWS comments between ids are valid RFC 2822
+        ("<a@x.com> (resent) <b@y.com>", ["<a@x.com>", "<b@y.com>"]),
+        # Nonconforming comma separators seen in the wild
+        ("<a@x.com>, <b@y.com>", ["<a@x.com>", "<b@y.com>"]),
+        # Folded header remnants: newlines and tabs
+        ("<a@x.com>\n\t<b@y.com>", ["<a@x.com>", "<b@y.com>"]),
+    ])
+    def test_parse_references(self, header_value, expected):
+        from gmail_utils import parse_references
+        assert parse_references(header_value) == expected
+
+    @pytest.mark.parametrize("header_value,expected", [
+        ("", []),
+        ("a@x.com", ["a@x.com"]),
+        ("Jane Colleague <jane@example.com>", ["Jane Colleague <jane@example.com>"]),
+        ("a@x.com, b@y.com", ["a@x.com", "b@y.com"]),
+        # Display name containing a comma must not be split
+        ('"Doe, John" <j@x.com>, jane@y.com', ['"Doe, John" <j@x.com>', "jane@y.com"]),
+    ])
+    def test_parse_address_list(self, header_value, expected):
+        from gmail_utils import parse_address_list
+        assert parse_address_list(header_value) == expected
 
 
 class TestBuildGmailQuery:

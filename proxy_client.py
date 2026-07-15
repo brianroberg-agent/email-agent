@@ -304,18 +304,23 @@ class GmailProxyClient:
         self,
         raw_message: str,
         user_id: str = "me",
+        thread_id: Optional[str] = None,
     ) -> dict:
         """Create a new draft.
 
         Args:
             raw_message: Base64url-encoded RFC 2822 message string.
             user_id: The user's email address or 'me' for authenticated user.
+            thread_id: Gmail thread ID to attach the draft to (for replies).
 
         Returns:
             The created draft resource.
         """
         url = f"{self.proxy_url}/gmail/v1/users/{user_id}/drafts"
-        body = {"message": {"raw": raw_message}}
+        message: dict = {"raw": raw_message}
+        if thread_id:
+            message["threadId"] = thread_id
+        body = {"message": message}
 
         async with httpx.AsyncClient(timeout=30.0) as client:
             response = await client.post(url, headers=self._get_headers(), json=body)
@@ -326,6 +331,7 @@ class GmailProxyClient:
         draft_id: str,
         raw_message: str,
         user_id: str = "me",
+        thread_id: Optional[str] = None,
     ) -> dict:
         """Update an existing draft.
 
@@ -333,12 +339,16 @@ class GmailProxyClient:
             draft_id: The ID of the draft to update.
             raw_message: Base64url-encoded RFC 2822 message string.
             user_id: The user's email address or 'me' for authenticated user.
+            thread_id: Gmail thread ID to attach the draft to (for replies).
 
         Returns:
             The updated draft resource.
         """
         url = f"{self.proxy_url}/gmail/v1/users/{user_id}/drafts/{draft_id}"
-        body = {"message": {"raw": raw_message}}
+        message: dict = {"raw": raw_message}
+        if thread_id:
+            message["threadId"] = thread_id
+        body = {"message": message}
 
         async with httpx.AsyncClient(timeout=30.0) as client:
             response = await client.put(url, headers=self._get_headers(), json=body)
