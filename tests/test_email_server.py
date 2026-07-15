@@ -10,6 +10,7 @@ Testing patterns inspired by datasette-enrichments:
 import pytest
 from unittest.mock import Mock, patch, AsyncMock
 
+from email_server import LLMResult
 from tests.conftest import SAMPLE_MESSAGES
 
 
@@ -345,7 +346,7 @@ class TestSummarizeEndpoint:
         mock_get_client.return_value = mock_proxy_client
         mock_proxy_client.get_message.return_value = SAMPLE_MESSAGES["with_body"]
 
-        mock_llm.return_value = "The sender is thanking you for the conversation."
+        mock_llm.return_value = LLMResult("The sender is thanking you for the conversation.")
 
         response = client.post("/summarize", json={"message_id": "msg123"})
         assert response.status_code == 200
@@ -353,7 +354,26 @@ class TestSummarizeEndpoint:
         data = response.json()
         assert data["success"] is True
         assert data["answer"] == "The sender is thanking you for the conversation."
+        assert data["degraded"] is False
         assert data["error"] is None
+
+    @patch("email_server.call_local_llm", new_callable=AsyncMock)
+    @patch("email_server.get_gmail_client")
+    def test_summarize_surfaces_degraded_flag(self, mock_get_client, mock_llm, client):
+        """A reasoning-fallback answer is flagged so callers can treat it with caution."""
+        from email_server import LLMResult
+        mock_proxy_client = AsyncMock()
+        mock_get_client.return_value = mock_proxy_client
+        mock_proxy_client.get_message.return_value = SAMPLE_MESSAGES["with_body"]
+
+        mock_llm.return_value = LLMResult("Salvaged from reasoning trace", degraded=True)
+
+        response = client.post("/summarize", json={"message_id": "msg123"})
+        data = response.json()
+
+        assert data["success"] is True
+        assert data["answer"] == "Salvaged from reasoning trace"
+        assert data["degraded"] is True
 
     @patch("email_server.call_local_llm", new_callable=AsyncMock)
     @patch("email_server.get_gmail_client")
@@ -362,7 +382,7 @@ class TestSummarizeEndpoint:
         mock_get_client.return_value = mock_proxy_client
         mock_proxy_client.get_message.return_value = SAMPLE_MESSAGES["with_body"]
 
-        mock_llm.return_value = "Summary here"
+        mock_llm.return_value = LLMResult("Summary here")
 
         client.post("/summarize", json={"message_id": "msg123"})
 
@@ -378,7 +398,7 @@ class TestSummarizeEndpoint:
         mock_get_client.return_value = mock_proxy_client
         mock_proxy_client.get_message.return_value = SAMPLE_MESSAGES["multipart"]
 
-        mock_llm.return_value = "Summary of multipart email"
+        mock_llm.return_value = LLMResult("Summary of multipart email")
 
         response = client.post("/summarize", json={"message_id": "msg456"})
         assert response.status_code == 200
@@ -397,7 +417,7 @@ class TestSummarizeEndpoint:
         mock_get_client.return_value = mock_proxy_client
         mock_proxy_client.get_message.return_value = SAMPLE_MESSAGES["long_body"]
 
-        mock_llm.return_value = "Summary of long email"
+        mock_llm.return_value = LLMResult("Summary of long email")
 
         client.post("/summarize", json={"message_id": "msg_long"})
 
@@ -445,7 +465,7 @@ class TestAskAboutEndpoint:
         mock_get_client.return_value = mock_proxy_client
         mock_proxy_client.get_message.return_value = SAMPLE_MESSAGES["with_body"]
 
-        mock_llm.return_value = "No, the sender did not mention a specific dollar amount."
+        mock_llm.return_value = LLMResult("No, the sender did not mention a specific dollar amount.")
 
         response = client.post("/ask-about", json={
             "message_id": "msg123",
@@ -460,12 +480,31 @@ class TestAskAboutEndpoint:
 
     @patch("email_server.call_local_llm", new_callable=AsyncMock)
     @patch("email_server.get_gmail_client")
+    def test_ask_about_surfaces_degraded_flag(self, mock_get_client, mock_llm, client):
+        from email_server import LLMResult
+        mock_proxy_client = AsyncMock()
+        mock_get_client.return_value = mock_proxy_client
+        mock_proxy_client.get_message.return_value = SAMPLE_MESSAGES["with_body"]
+
+        mock_llm.return_value = LLMResult("Salvaged answer", degraded=True)
+
+        response = client.post("/ask-about", json={
+            "message_id": "msg123",
+            "question": "What does the sender want?"
+        })
+        data = response.json()
+
+        assert data["success"] is True
+        assert data["degraded"] is True
+
+    @patch("email_server.call_local_llm", new_callable=AsyncMock)
+    @patch("email_server.get_gmail_client")
     def test_ask_about_includes_question_in_prompt(self, mock_get_client, mock_llm, client):
         mock_proxy_client = AsyncMock()
         mock_get_client.return_value = mock_proxy_client
         mock_proxy_client.get_message.return_value = SAMPLE_MESSAGES["with_body"]
 
-        mock_llm.return_value = "Answer here"
+        mock_llm.return_value = LLMResult("Answer here")
 
         client.post("/ask-about", json={
             "message_id": "msg123",
@@ -483,7 +522,7 @@ class TestAskAboutEndpoint:
         mock_get_client.return_value = mock_proxy_client
         mock_proxy_client.get_message.return_value = SAMPLE_MESSAGES["with_body"]
 
-        mock_llm.return_value = "Answer"
+        mock_llm.return_value = LLMResult("Answer")
 
         client.post("/ask-about", json={
             "message_id": "msg123",
@@ -509,7 +548,7 @@ class TestAskAboutEndpoint:
         mock_get_client.return_value = mock_proxy_client
         mock_proxy_client.get_message.return_value = SAMPLE_MESSAGES["with_body"]
 
-        mock_llm.return_value = f"Answer to: {question}"
+        mock_llm.return_value = LLMResult(f"Answer to: {question}")
 
         response = client.post("/ask-about", json={
             "message_id": "msg123",
@@ -871,8 +910,9 @@ class TestCallLocalLLM:
         with patch.object(httpx.AsyncClient, "post", new_callable=AsyncMock) as mock_post:
             mock_post.return_value = mock_response
             result = await call_local_llm("System prompt", "User content")
-            assert result == "Actual response"
-            assert "<think>" not in result
+            assert result.text == "Actual response"
+            assert "<think>" not in result.text
+            assert result.degraded is False
 
     @pytest.mark.asyncio
     async def test_call_local_llm_no_thinking_tags(self):
@@ -889,7 +929,8 @@ class TestCallLocalLLM:
         with patch.object(httpx.AsyncClient, "post", new_callable=AsyncMock) as mock_post:
             mock_post.return_value = mock_response
             result = await call_local_llm("System prompt", "User content")
-            assert result == "Simple response without thinking"
+            assert result.text == "Simple response without thinking"
+            assert result.degraded is False
 
     @pytest.mark.asyncio
     async def test_call_local_llm_raises_unreachable_on_connect_error(self):
@@ -996,10 +1037,127 @@ class TestCallLocalLLM:
         ) as mock_post:
             mock_post.return_value = mock_response
             result = await call_local_llm("System prompt", "User content")
-            assert result == "I think the answer is 42."
+            assert result.text == "I think the answer is 42."
+            assert result.degraded is True
             captured = capsys.readouterr()
             assert "WARN" in captured.err
             assert "reasoning_content fallback" in captured.err
+
+    @pytest.mark.asyncio
+    async def test_call_local_llm_raises_on_length_exhaustion_even_with_reasoning(self):
+        """Truncated chain-of-thought is not a usable answer — raise, don't salvage."""
+        import httpx
+        from unittest.mock import MagicMock
+        from email_server import call_local_llm, LLMEmptyResponseError
+
+        mock_response = MagicMock()
+        mock_response.json.return_value = {
+            "choices": [
+                {
+                    "message": {
+                        "content": "",
+                        "reasoning_content": "Partial reasoning that got cut o",
+                    },
+                    "finish_reason": "length",
+                }
+            ]
+        }
+        mock_response.raise_for_status = MagicMock()
+
+        with patch.object(
+            httpx.AsyncClient, "post", new_callable=AsyncMock
+        ) as mock_post:
+            mock_post.return_value = mock_response
+            with pytest.raises(LLMEmptyResponseError) as exc_info:
+                await call_local_llm("System prompt", "User content")
+            msg = str(exc_info.value)
+            assert "finish_reason=length" in msg
+            assert "max_tokens" in msg
+            assert "truncated" in msg
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("finish_reason", ["stop", "length"])
+    async def test_call_local_llm_think_only_content_is_empty(self, finish_reason):
+        """A completion that is nothing but a <think> block is an empty answer,
+        not a success — the guard must run after thinking tags are stripped."""
+        import httpx
+        from unittest.mock import MagicMock
+        from email_server import call_local_llm, LLMEmptyResponseError
+
+        mock_response = MagicMock()
+        mock_response.json.return_value = {
+            "choices": [
+                {
+                    "message": {"content": "<think>All budget spent thinking.</think>"},
+                    "finish_reason": finish_reason,
+                }
+            ]
+        }
+        mock_response.raise_for_status = MagicMock()
+
+        with patch.object(
+            httpx.AsyncClient, "post", new_callable=AsyncMock
+        ) as mock_post:
+            mock_post.return_value = mock_response
+            with pytest.raises(LLMEmptyResponseError):
+                await call_local_llm("System prompt", "User content")
+
+    @pytest.mark.asyncio
+    async def test_call_local_llm_unclosed_think_block_is_empty(self):
+        """Mid-think truncation leaves an unclosed <think> tag; the raw partial
+        chain-of-thought must not leak out as the answer."""
+        import httpx
+        from unittest.mock import MagicMock
+        from email_server import call_local_llm, LLMEmptyResponseError
+
+        mock_response = MagicMock()
+        mock_response.json.return_value = {
+            "choices": [
+                {
+                    "message": {"content": "<think>partial reasoning that never fini"},
+                    "finish_reason": "length",
+                }
+            ]
+        }
+        mock_response.raise_for_status = MagicMock()
+
+        with patch.object(
+            httpx.AsyncClient, "post", new_callable=AsyncMock
+        ) as mock_post:
+            mock_post.return_value = mock_response
+            with pytest.raises(LLMEmptyResponseError):
+                await call_local_llm("System prompt", "User content")
+
+    @pytest.mark.asyncio
+    async def test_call_local_llm_unknown_finish_reason_not_reported_as_truncated(self):
+        """Unrecognized finish_reason with intact reasoning must not claim truncation."""
+        import httpx
+        from unittest.mock import MagicMock
+        from email_server import call_local_llm, LLMEmptyResponseError
+
+        mock_response = MagicMock()
+        mock_response.json.return_value = {
+            "choices": [
+                {
+                    "message": {
+                        "content": "",
+                        "reasoning_content": "Complete, untruncated reasoning.",
+                    },
+                    "finish_reason": None,
+                }
+            ]
+        }
+        mock_response.raise_for_status = MagicMock()
+
+        with patch.object(
+            httpx.AsyncClient, "post", new_callable=AsyncMock
+        ) as mock_post:
+            mock_post.return_value = mock_response
+            with pytest.raises(LLMEmptyResponseError) as exc_info:
+                await call_local_llm("System prompt", "User content")
+            msg = str(exc_info.value)
+            assert "not salvaged" in msg
+            assert "truncated" not in msg
 
 
 class TestFormatProxyError:
@@ -1083,7 +1241,7 @@ class TestBatchSummarizeEndpoint:
         mock_get_client.return_value = mock_proxy_client
         mock_proxy_client.get_message.return_value = SAMPLE_MESSAGES["with_body"]
 
-        mock_llm.return_value = '{"summary": "Test summary", "detected_action": "info_only", "detected_deadline": null}'
+        mock_llm.return_value = LLMResult('{"summary": "Test summary", "detected_action": "info_only", "detected_deadline": null}')
 
         response = client.post("/batch-summarize", json={"message_ids": ["msg123", "msg456"]})
         assert response.status_code == 200
@@ -1097,12 +1255,33 @@ class TestBatchSummarizeEndpoint:
 
     @patch("email_server.call_local_llm", new_callable=AsyncMock)
     @patch("email_server.get_gmail_client")
+    def test_batch_summarize_surfaces_degraded_flag(self, mock_get_client, mock_llm, client):
+        from email_server import LLMResult
+        mock_proxy_client = AsyncMock()
+        mock_get_client.return_value = mock_proxy_client
+        mock_proxy_client.get_message.return_value = SAMPLE_MESSAGES["with_body"]
+
+        mock_llm.return_value = LLMResult(
+            '{"summary": "Salvaged", "detected_action": null, "detected_deadline": null}',
+            degraded=True,
+        )
+
+        response = client.post("/batch-summarize", json={"message_ids": ["msg123"]})
+        data = response.json()
+
+        result = data["results"][0]
+        assert result["success"] is True
+        assert result["summary"] == "Salvaged"
+        assert result["degraded"] is True
+
+    @patch("email_server.call_local_llm", new_callable=AsyncMock)
+    @patch("email_server.get_gmail_client")
     def test_batch_summarize_parses_json_response(self, mock_get_client, mock_llm, client):
         mock_proxy_client = AsyncMock()
         mock_get_client.return_value = mock_proxy_client
         mock_proxy_client.get_message.return_value = SAMPLE_MESSAGES["with_body"]
 
-        mock_llm.return_value = '{"summary": "Review this PR", "detected_action": "review_requested", "detected_deadline": "2026-02-01"}'
+        mock_llm.return_value = LLMResult('{"summary": "Review this PR", "detected_action": "review_requested", "detected_deadline": "2026-02-01"}')
 
         response = client.post("/batch-summarize", json={"message_ids": ["msg123"]})
         data = response.json()
@@ -1120,7 +1299,7 @@ class TestBatchSummarizeEndpoint:
         mock_proxy_client.get_message.return_value = SAMPLE_MESSAGES["with_body"]
 
         # Non-JSON response should fall back to raw summary
-        mock_llm.return_value = "This is a plain text summary without JSON."
+        mock_llm.return_value = LLMResult("This is a plain text summary without JSON.")
 
         response = client.post("/batch-summarize", json={"message_ids": ["msg123"]})
         data = response.json()
@@ -1138,7 +1317,7 @@ class TestBatchSummarizeEndpoint:
         mock_proxy_client.get_message.return_value = SAMPLE_MESSAGES["with_body"]
 
         # Invalid action type should be ignored
-        mock_llm.return_value = '{"summary": "Test", "detected_action": "unknown_action", "detected_deadline": null}'
+        mock_llm.return_value = LLMResult('{"summary": "Test", "detected_action": "unknown_action", "detected_deadline": null}')
 
         response = client.post("/batch-summarize", json={"message_ids": ["msg123"]})
         data = response.json()
@@ -1160,7 +1339,7 @@ class TestBatchSummarizeEndpoint:
             return SAMPLE_MESSAGES["with_body"]
 
         mock_proxy_client.get_message.side_effect = get_side_effect
-        mock_llm.return_value = '{"summary": "Success", "detected_action": null, "detected_deadline": null}'
+        mock_llm.return_value = LLMResult('{"summary": "Success", "detected_action": null, "detected_deadline": null}')
 
         response = client.post("/batch-summarize", json={"message_ids": ["msg_ok", "msg_fail"]})
         data = response.json()
@@ -1202,7 +1381,7 @@ class TestBatchSummarizeEndpoint:
         mock_get_client.return_value = mock_proxy_client
         mock_proxy_client.get_message.return_value = SAMPLE_MESSAGES["with_body"]
 
-        mock_llm.return_value = f'{{"summary": "Test", "detected_action": "{action_type}", "detected_deadline": null}}'
+        mock_llm.return_value = LLMResult(f'{{"summary": "Test", "detected_action": "{action_type}", "detected_deadline": null}}')
 
         response = client.post("/batch-summarize", json={"message_ids": ["msg123"]})
         data = response.json()

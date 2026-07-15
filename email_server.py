@@ -14,7 +14,7 @@ import os
 import re
 import sys
 from enum import Enum
-from typing import Optional
+from typing import NamedTuple, Optional
 
 import httpx
 from fastapi import FastAPI, HTTPException
@@ -39,6 +39,15 @@ LLM_MAX_TOKENS = 4096
 
 # Qwen3 wraps chain-of-thought in <think> tags - strip them from output
 THINKING_PATTERN = re.compile(r"<think>.*?</think>\s*", re.DOTALL)
+# A <think> tag never closed means generation was cut off mid-thought;
+# everything from the tag onward is partial chain-of-thought, not answer.
+UNCLOSED_THINKING_PATTERN = re.compile(r"<think>.*", re.DOTALL)
+
+
+def strip_thinking(text: str) -> str:
+    """Remove closed and unclosed <think> blocks from LLM output."""
+    text = THINKING_PATTERN.sub("", text)
+    return UNCLOSED_THINKING_PATTERN.sub("", text).strip()
 
 print(
     f"email-agent: MLX_URL={MLX_URL} MLX_MODEL={MLX_MODEL} "
@@ -66,6 +75,17 @@ class LLMHTTPError(LLMError):
 
 class LLMEmptyResponseError(LLMError):
     pass
+
+
+class LLMResult(NamedTuple):
+    """Result of a local LLM call.
+
+    degraded=True means text was salvaged from the model's reasoning trace
+    because the server returned an empty `content` field; it is raw
+    chain-of-thought, not a polished answer.
+    """
+    text: str
+    degraded: bool = False
 
 # System prompts for LLM
 SUMMARIZE_SYSTEM_PROMPT = """You are summarizing an email for a busy professional. Provide a concise 2-3 sentence summary.
@@ -152,6 +172,7 @@ class AskAboutRequest(BaseModel):
 class LLMResponse(BaseModel):
     success: bool
     answer: str
+    degraded: bool = Field(False, description="True if the answer was salvaged from the model's reasoning trace rather than a proper completion; treat with caution")
     error: Optional[str] = None
 
 
@@ -210,6 +231,7 @@ class EmailSummaryResult(BaseModel):
     summary: Optional[str] = None
     detected_action: Optional[DetectedAction] = None
     detected_deadline: Optional[str] = None
+    degraded: bool = Field(False, description="True if the summary was salvaged from the model's reasoning trace rather than a proper completion; treat with caution")
     error: Optional[str] = None
 
 
@@ -297,7 +319,7 @@ class GetDraftResponse(BaseModel):
     error: Optional[str] = None
 
 
-async def call_local_llm(system_prompt: str, user_content: str) -> str:
+async def call_local_llm(system_prompt: str, user_content: str) -> LLMResult:
     """Call the local LLM (Qwen3-14B via MLX) for summarization or Q&A.
 
     Args:
@@ -305,7 +327,8 @@ async def call_local_llm(system_prompt: str, user_content: str) -> str:
         user_content: The email content to process
 
     Returns:
-        LLM response with thinking tags stripped
+        LLMResult with thinking tags stripped. degraded=True when the text
+        came from the reasoning_content fallback rather than a real answer.
     """
     payload = {
         "model": MLX_MODEL,
@@ -350,26 +373,39 @@ async def call_local_llm(system_prompt: str, user_content: str) -> str:
     data = response.json()
     message = data["choices"][0]["message"]
     finish_reason = data["choices"][0].get("finish_reason")
-    text = (message.get("content") or "").strip()
-    if not text:
-        reasoning = (message.get("reasoning_content") or "").strip()
-        if reasoning:
-            print(
-                "WARN: MLX returned empty content; using reasoning_content "
-                f"fallback (finish_reason={finish_reason})",
-                file=sys.stderr,
-                flush=True,
-            )
-            text = reasoning
-        else:
-            raise LLMEmptyResponseError(
-                f"MLX returned empty completion "
-                f"(finish_reason={finish_reason}, model={MLX_MODEL}). "
-                f"If finish_reason='length', max_tokens ({LLM_MAX_TOKENS}) "
-                f"may be too low for this reasoning model — increase "
-                f"LLM_MAX_TOKENS or switch to a non-reasoning model."
-            )
-    return THINKING_PATTERN.sub("", text).strip()
+    # Strip thinking blocks before the empty check so a completion that is
+    # nothing but chain-of-thought counts as empty rather than a success.
+    text = strip_thinking(message.get("content") or "")
+    if text:
+        return LLMResult(text, degraded=False)
+
+    reasoning = strip_thinking(message.get("reasoning_content") or "")
+    # Salvage reasoning_content only on a clean finish: that indicates the
+    # server misfiled a complete answer. On finish_reason=length the
+    # reasoning is truncated mid-thought and not a usable answer.
+    if reasoning and finish_reason == "stop":
+        print(
+            "WARN: MLX returned empty content; using reasoning_content "
+            f"fallback (finish_reason={finish_reason})",
+            file=sys.stderr,
+            flush=True,
+        )
+        return LLMResult(reasoning, degraded=True)
+
+    if reasoning and finish_reason == "length":
+        note = " Its reasoning_content was truncated mid-thought and unusable."
+    elif reasoning:
+        note = " Its reasoning_content was not salvaged (unrecognized finish_reason)."
+    else:
+        note = ""
+    raise LLMEmptyResponseError(
+        f"MLX returned empty completion "
+        f"(finish_reason={finish_reason}, model={MLX_MODEL})."
+        f"{note} "
+        f"If finish_reason='length', max_tokens ({LLM_MAX_TOKENS}) "
+        f"may be too low for this reasoning model — increase "
+        f"LLM_MAX_TOKENS or switch to a non-reasoning model."
+    )
 
 
 def build_gmail_query(request: SearchRequest) -> str:
@@ -631,8 +667,8 @@ async def summarize(request: SummarizeRequest):
         if len(body) > MAX_BODY_LENGTH:
             body = body[:MAX_BODY_LENGTH] + "..."
 
-        summary = await call_local_llm(SUMMARIZE_SYSTEM_PROMPT, body)
-        return LLMResponse(success=True, answer=summary, error=None)
+        result = await call_local_llm(SUMMARIZE_SYSTEM_PROMPT, body)
+        return LLMResponse(success=True, answer=result.text, degraded=result.degraded, error=None)
 
     except Exception as e:
         return LLMResponse(success=False, answer="", error=format_proxy_error(e))
@@ -655,8 +691,8 @@ async def ask_about(request: AskAboutRequest):
             body = body[:MAX_BODY_LENGTH] + "..."
 
         user_content = f"Question: {request.question}\n\nEmail content:\n{body}"
-        answer = await call_local_llm(ASK_ABOUT_SYSTEM_PROMPT, user_content)
-        return LLMResponse(success=True, answer=answer, error=None)
+        result = await call_local_llm(ASK_ABOUT_SYSTEM_PROMPT, user_content)
+        return LLMResponse(success=True, answer=result.text, degraded=result.degraded, error=None)
 
     except Exception as e:
         return LLMResponse(success=False, answer="", error=format_proxy_error(e))
@@ -720,7 +756,8 @@ async def batch_summarize(request: BatchSummarizeRequest):
                 if len(body) > MAX_BODY_LENGTH:
                     body = body[:MAX_BODY_LENGTH] + "..."
 
-                llm_response = await call_local_llm(TRIAGE_SYSTEM_PROMPT, body)
+                llm_result = await call_local_llm(TRIAGE_SYSTEM_PROMPT, body)
+                llm_response = llm_result.text
 
                 # Try to parse JSON response
                 try:
@@ -743,6 +780,7 @@ async def batch_summarize(request: BatchSummarizeRequest):
                         summary=summary,
                         detected_action=detected_action,
                         detected_deadline=detected_deadline,
+                        degraded=llm_result.degraded,
                     ))
                 except json.JSONDecodeError:
                     # Fall back to raw response as summary
@@ -752,6 +790,7 @@ async def batch_summarize(request: BatchSummarizeRequest):
                         summary=llm_response,
                         detected_action=None,
                         detected_deadline=None,
+                        degraded=llm_result.degraded,
                     ))
 
             except Exception as e:

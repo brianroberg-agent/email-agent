@@ -186,9 +186,12 @@ Response:
 {
   "success": true,
   "answer": "The sender is thanking you for the conversation and mentions being available next month.",
+  "degraded": false,
   "error": null
 }
 ```
+
+`degraded: true` means the answer was salvaged from the model's reasoning trace because the LLM server returned an empty completion with a clean finish — the text is raw chain-of-thought, not a polished answer, and should be treated with caution.
 
 ### POST /ask-about
 
@@ -205,6 +208,7 @@ Response:
 {
   "success": true,
   "answer": "No, the sender did not mention a specific deadline.",
+  "degraded": false,
   "error": null
 }
 ```
@@ -275,6 +279,7 @@ Response:
       "summary": "John is requesting a review of the Q4 report by Friday.",
       "detected_action": "review_requested",
       "detected_deadline": "2026-02-01",
+      "degraded": false,
       "error": null
     },
     {
@@ -283,6 +288,7 @@ Response:
       "summary": "Weekly newsletter with company updates.",
       "detected_action": "info_only",
       "detected_deadline": null,
+      "degraded": false,
       "error": null
     }
   ],
