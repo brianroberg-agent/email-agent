@@ -809,6 +809,9 @@ class TestCreateDraftEndpoint:
         data = response.json()
         assert data["thread_id"] == "t_other"
         assert data["thread_attached"] is False
+        # The mismatch must be loud: this is how a proxy that silently
+        # drops threadId (the E2E failure on issue #2) gets noticed.
+        assert "instead of requested" in data["message"]
 
     @patch("email_server.get_gmail_client")
     def test_create_draft_caps_lookups_at_three(self, mock_get_client, client):

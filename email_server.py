@@ -706,9 +706,16 @@ def draft_success_response(
     thread_id reports the result's actual thread, falling back to the
     requested one when the proxy result carries no message stub;
     thread_attached is true only when a thread was requested and the
-    result does not contradict it.
+    result does not contradict it. A contradiction also gets a warning:
+    it means the proxy or Gmail ignored the requested threadId.
     """
     actual = draft_message_thread_id(result)
+    if thread_id is not None and actual is not None and actual != thread_id:
+        note += (
+            f" (warning: draft landed in thread {actual} instead of "
+            f"requested {thread_id} — the proxy or Gmail may have ignored "
+            f"threadId)"
+        )
     return DraftResponse(
         success=True,
         draft_id=draft_id,
