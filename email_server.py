@@ -21,7 +21,14 @@ import httpx
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 
-from gmail_utils import get_header, decode_body, parse_address_list, parse_references
+from gmail_utils import (
+    get_header,
+    decode_body,
+    parse_address_list,
+    parse_references,
+    extract_message_ids,
+    normalize_reply_header,
+)
 from message_builder import build_rfc2822
 from proxy_client import (
     get_gmail_client,
@@ -307,14 +314,17 @@ class DraftRequest(BaseModel):
     body: str = Field(..., description="Email body (plain text)")
     cc: Optional[list[str]] = Field(None, description="CC recipients")
     bcc: Optional[list[str]] = Field(None, description="BCC recipients")
-    in_reply_to: Optional[str] = Field(None, description="Message-ID to reply to (for threading)")
-    references: Optional[list[str]] = Field(None, description="Thread Message-IDs (for threading)")
-    thread_id: Optional[str] = Field(None, description="Gmail thread ID to attach the draft to (from /search thread_id, for replies)")
+    in_reply_to: Optional[str] = Field(None, description="RFC 2822 Message-ID being replied to; sets reply headers and, on create (unless thread_id or attach_to_thread=false is given), auto-attaches the draft to that message's Gmail conversation. Updates keep the draft's current thread; pass thread_id to move it")
+    references: Optional[list[str]] = Field(None, description="Thread Message-IDs for the References header; also used (newest first) for conversation lookup when in_reply_to is absent")
+    thread_id: Optional[str] = Field(None, description="Gmail thread ID to attach the draft to (optional; resolved automatically from in_reply_to/references when omitted)")
+    attach_to_thread: bool = Field(True, description="Set false to skip Gmail-thread lookup and, on update, thread preservation, keeping the draft standalone; an explicit thread_id is still honored")
 
 
 class DraftResponse(BaseModel):
     success: bool
     draft_id: Optional[str] = None
+    thread_id: Optional[str] = Field(None, description="Gmail thread the draft's message lives in (a standalone draft gets its own fresh thread)")
+    thread_attached: bool = Field(False, description="True when a Gmail thread was set on the draft's message (explicit thread_id, in_reply_to/references resolution on create, or an update preserving the draft's current thread) and the result does not contradict it")
     message: str
     error: Optional[str] = None
 
@@ -335,6 +345,7 @@ class ListDraftsResponse(BaseModel):
 class GetDraftResponse(BaseModel):
     success: bool
     draft_id: Optional[str] = None
+    thread_id: Optional[str] = Field(None, description="Gmail thread the draft is attached to")
     to: Optional[list[str]] = None
     cc: Optional[list[str]] = None
     bcc: Optional[list[str]] = None
@@ -547,6 +558,172 @@ def format_proxy_error(e: Exception) -> str:
     if isinstance(e, ProxyError):
         return f"Proxy error: {e}"
     return f"{type(e).__name__}: {e}" if str(e) else type(e).__name__
+
+
+async def resolve_thread_id(client, msgid: str) -> Optional[str]:
+    """Resolve the Gmail thread ID of the message bearing an RFC 2822
+    Message-ID, so a reply draft can be attached to its conversation.
+
+    RFC headers (In-Reply-To/References) only thread the reply on the
+    recipient's side; Gmail places a draft in the local conversation solely
+    by the message resource's threadId. in:anywhere widens the search to
+    Spam/Trash, which Gmail queries exclude by default.
+
+    Args:
+        client: GmailProxyClient instance
+        msgid: canonical <local@domain> id from extract_message_ids /
+            normalize_message_id — that strict grammar is what makes the
+            interpolation below injection-safe. The query uses the bare
+            form from Gmail's search-operators reference.
+
+    Returns:
+        The thread ID, or None when no message matches.
+    """
+    if not msgid:
+        return None
+    result = await client.list_messages(
+        q=f"rfc822msgid:{msgid.strip('<>')} in:anywhere", max_results=1
+    )
+    messages = (result or {}).get("messages") or []
+    if not messages:
+        return None
+    return messages[0].get("threadId") or None
+
+
+def draft_message_thread_id(resource) -> Optional[str]:
+    """The threadId of a draft resource's embedded message, if any."""
+    message = (resource if isinstance(resource, dict) else {}).get("message")
+    if not isinstance(message, dict):
+        return None
+    return message.get("threadId") or None
+
+
+async def resolve_draft_thread(
+    client, request: "DraftRequest", existing_draft_id: Optional[str] = None
+) -> tuple[Optional[str], str]:
+    """Determine which Gmail thread a draft should be attached to.
+
+    Create: explicit request.thread_id, else — unless
+    attach_to_thread=False — a best-effort rfc822msgid lookup of
+    in_reply_to and the references chain, newest first, capped at three
+    proxy round-trips (a timeout stops the iteration; other per-candidate
+    failures skip to the next candidate).
+
+    Update: explicit request.thread_id, else — unless
+    attach_to_thread=False — the draft's current thread, with read errors
+    propagating (never risk a silent detach). Updates never re-resolve
+    reply headers: Gmail gives every draft message a threadId (standalone
+    drafts get their own singleton thread), so the current thread is the
+    only truthful signal and moving a draft must be explicit.
+
+    Returns:
+        (thread_id, note): note explains any degradation and is appended
+        to the response message.
+    """
+    if request.thread_id:
+        return request.thread_id, ""
+
+    if not request.attach_to_thread:
+        return None, ""
+
+    if existing_draft_id is not None:
+        current = await client.get_draft(existing_draft_id, format="minimal")
+        return draft_message_thread_id(current), ""
+
+    candidates = list(extract_message_ids(request.in_reply_to or ""))
+    for ref in reversed(request.references or []):
+        # A references item may itself hold several ids (a whole header
+        # value); within it the last id is the newest.
+        candidates.extend(reversed(extract_message_ids(ref)))
+    msgids = list(dict.fromkeys(candidates))
+
+    reason = None
+    if (request.in_reply_to or request.references) and not msgids:
+        reason = (
+            "no Message-ID usable for a Gmail lookup was found "
+            "in the reply headers"
+        )
+
+    # Bound the proxy round-trips when a long references chain misses.
+    for msgid in msgids[:3]:
+        try:
+            resolved = await resolve_thread_id(client, msgid)
+        except httpx.TimeoutException as e:
+            # The proxy is hanging; don't burn a full timeout per candidate.
+            reason = f"thread lookup failed: {format_proxy_error(e)}"
+            break
+        except Exception as e:
+            reason = f"thread lookup failed: {format_proxy_error(e)}"
+            continue
+        if resolved:
+            return resolved, ""
+    if msgids and reason is None:
+        reason = "could not find the message being replied to"
+
+    if reason:
+        return None, (
+            f" (warning: {reason}; "
+            f"draft is not attached to its Gmail conversation)"
+        )
+    return None, ""
+
+
+def build_draft_message(request: "DraftRequest") -> str:
+    """Build the base64url RFC 2822 message for a draft request.
+
+    Threading header values are normalized to the bracketed form
+    recipients' clients need: bare ids are wrapped, while multi-id and
+    other already-formed values pass through verbatim.
+    """
+    in_reply_to = (
+        normalize_reply_header(request.in_reply_to) if request.in_reply_to else None
+    )
+    references = (
+        [normalize_reply_header(ref) for ref in request.references]
+        if request.references
+        else None
+    )
+    return build_rfc2822(
+        to=request.to,
+        subject=request.subject,
+        body=request.body,
+        cc=request.cc,
+        bcc=request.bcc,
+        in_reply_to=in_reply_to,
+        references=references,
+    )
+
+
+def draft_success_response(
+    result: Optional[dict],
+    draft_id: Optional[str],
+    thread_id: Optional[str],
+    note: str,
+    action: str,
+) -> DraftResponse:
+    """Build the success response shared by draft create and update.
+
+    thread_id reports the result's actual thread, falling back to the
+    requested one when the proxy result carries no message stub;
+    thread_attached is true only when a thread was requested and the
+    result does not contradict it. A contradiction also gets a warning:
+    it means the proxy or Gmail ignored the requested threadId.
+    """
+    actual = draft_message_thread_id(result)
+    if thread_id is not None and actual is not None and actual != thread_id:
+        note += (
+            f" (warning: draft landed in thread {actual} instead of "
+            f"requested {thread_id} — the proxy or Gmail may have ignored "
+            f"threadId)"
+        )
+    return DraftResponse(
+        success=True,
+        draft_id=draft_id,
+        thread_id=actual or thread_id,
+        thread_attached=thread_id is not None
+        and (actual is None or actual == thread_id),
+        message=f"Draft {action}: {draft_id}{note}",
+    )
 
 
 async def resolve_label_id(client, label_name: str) -> str:
@@ -930,25 +1107,35 @@ async def create_draft(request: DraftRequest):
     as a draft in Gmail. Supports reply threading via in_reply_to and references.
     """
     try:
-        raw_message = build_rfc2822(
-            to=request.to,
-            subject=request.subject,
-            body=request.body,
-            cc=request.cc,
-            bcc=request.bcc,
-            in_reply_to=request.in_reply_to,
-            references=request.references,
-        )
+        raw_message = build_draft_message(request)
 
         client = get_gmail_client()
-        result = await client.create_draft(raw_message, thread_id=request.thread_id)
+        thread_id, thread_note = await resolve_draft_thread(client, request)
 
-        draft_id = result.get("id")
-        return DraftResponse(
-            success=True,
-            draft_id=draft_id,
-            message=f"Draft created: {draft_id}",
-        )
+        try:
+            result = await client.create_draft(raw_message, thread_id=thread_id)
+        except ProxyError:
+            if thread_id is None or request.thread_id:
+                raise
+            # The thread came from best-effort resolution; keep the
+            # documented promise that the draft is still created.
+            # (ProxyForbiddenError is not caught: a human-in-the-loop
+            # rejection applies to the draft itself.)
+            result = await client.create_draft(raw_message, thread_id=None)
+            thread_id = None
+            thread_note = (
+                " (warning: Gmail rejected attaching to the resolved thread; "
+                "draft created standalone)"
+            )
+
+        new_draft_id = (result or {}).get("id")
+        if not new_draft_id:
+            return DraftResponse(
+                success=False,
+                message="",
+                error="Proxy returned an unexpected create-draft response with no draft id",
+            )
+        return draft_success_response(result, new_draft_id, thread_id, thread_note, "created")
 
     except ValueError as e:
         return DraftResponse(success=False, message="", error=str(e))
@@ -1015,6 +1202,7 @@ async def get_draft(draft_id: str):
         return GetDraftResponse(
             success=True,
             draft_id=draft_id,
+            thread_id=draft_message_thread_id(result),
             to=to,
             cc=cc,
             bcc=bcc,
@@ -1036,24 +1224,16 @@ async def update_draft(draft_id: str, request: DraftRequest):
     from the provided structured fields.
     """
     try:
-        raw_message = build_rfc2822(
-            to=request.to,
-            subject=request.subject,
-            body=request.body,
-            cc=request.cc,
-            bcc=request.bcc,
-            in_reply_to=request.in_reply_to,
-            references=request.references,
-        )
+        raw_message = build_draft_message(request)
 
         client = get_gmail_client()
-        await client.update_draft(draft_id, raw_message, thread_id=request.thread_id)
-
-        return DraftResponse(
-            success=True,
-            draft_id=draft_id,
-            message=f"Draft updated: {draft_id}",
+        thread_id, thread_note = await resolve_draft_thread(
+            client, request, existing_draft_id=draft_id
         )
+
+        result = await client.update_draft(draft_id, raw_message, thread_id=thread_id)
+
+        return draft_success_response(result, draft_id, thread_id, thread_note, "updated")
 
     except ValueError as e:
         return DraftResponse(success=False, message="", error=str(e))

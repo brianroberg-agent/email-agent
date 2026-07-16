@@ -123,8 +123,7 @@ Search Gmail with structured parameters. Returns message metadata including snip
 Note that `id`/`thread_id` are Gmail API identifiers (use `id` with `/summarize`, `/ask-about`, etc., and `thread_id` with `/drafts/create`), while `rfc822_message_id`/`in_reply_to`/`references` are RFC 2822 email header values.
 
 To draft a reply to a search result, pass to `/drafts/create`:
-- `thread_id`: the result's `thread_id` (attaches the draft to the Gmail conversation)
-- `in_reply_to`: the result's `rfc822_message_id`
+- `in_reply_to`: the result's `rfc822_message_id` (the server resolves the Gmail conversation from this automatically; pass the result's `thread_id` explicitly to skip the lookup)
 - `references`: the result's `references` with its `rfc822_message_id` appended (per RFC 5322; if `references` is empty but `in_reply_to` is set, use `[in_reply_to, rfc822_message_id]`)
 
 ```bash
@@ -362,13 +361,17 @@ curl -X POST http://localhost:8081/drafts/create \
   -d '{"to": ["alice@example.com"], "subject": "Meeting follow-up", "body": "Thanks for the meeting.", "cc": ["bob@example.com"]}'
 ```
 
-Fields: `to` (required), `subject` (required), `body` (required), `cc`, `bcc`, `in_reply_to`, `references`, `thread_id`.
+Fields: `to` (required), `subject` (required), `body` (required), `cc`, `bcc`, `in_reply_to`, `references`, `thread_id`, `attach_to_thread`.
 
-For reply drafts, set `thread_id` (from the `/search` result) so the draft attaches to the existing Gmail conversation, and build `in_reply_to`/`references` from the result's RFC 2822 headers as described under `POST /search`. The same fields apply to `POST /drafts/{draft_id}/update`.
+For reply drafts, build `in_reply_to`/`references` from the search result's RFC 2822 headers as described under `POST /search`. When neither `thread_id` nor `attach_to_thread: false` is given, the server looks up the replied-to message's Gmail thread (a `rfc822msgid:` search including Spam/Trash, trying `in_reply_to` first and then the `references` chain newest-first) and attaches the draft to that conversation automatically. An explicit `thread_id` (from the `/search` result) is always honored and skips the lookup; `attach_to_thread: false` disables the lookup to keep a reply-headered draft standalone (e.g. a "New topic (was: ...)" message). The lookup is best-effort: if the replied-to message can't be found, the lookup fails, or Gmail rejects attaching to the resolved thread, the draft is still created — RFC headers thread it on the recipient's side — and the response `message` explains why it is not attached.
 
-Response:
+The response's `thread_attached` reports whether a Gmail thread was set on the draft's message; `thread_id` reports the thread the draft's message lives in (a standalone draft gets its own fresh thread, so check `thread_attached`, not `thread_id`, to confirm attachment).
+
+The same fields apply to `POST /drafts/{draft_id}/update`, but an update **always preserves the draft's current thread by default** and never re-resolves reply headers — every Gmail draft already has a threadId (standalone drafts get their own singleton thread), and the current thread embodies past decisions (an explicit `thread_id`, a deliberate detach), so a body edit never silently moves the draft. To move a draft into a conversation (including turning a standalone draft into a threaded reply) pass an explicit `thread_id` from `/search`; to detach it pass `attach_to_thread: false`. If the draft's current thread can't be read, the update fails rather than risking a detach.
+
+Response (for a reply create that resolved its conversation — a plain non-reply create reports `thread_attached: false` with the standalone draft's own fresh `thread_id`):
 ```json
-{"success": true, "draft_id": "r1234567890", "message": "Draft created: r1234567890", "error": null}
+{"success": true, "draft_id": "r1234567890", "thread_id": "18d5a3b2c4e5f001", "thread_attached": true, "message": "Draft created: r1234567890", "error": null}
 ```
 
 ### GET /drafts
@@ -394,7 +397,7 @@ curl http://localhost:8081/drafts/{draft_id}
 
 Response:
 ```json
-{"success": true, "draft_id": "r1234567890", "to": ["alice@example.com"], "cc": null, "bcc": null, "subject": "Draft subject", "body": "Full draft body text", "in_reply_to": null, "references": null, "error": null}
+{"success": true, "draft_id": "r1234567890", "thread_id": "18d5a3b2c4e5f001", "to": ["alice@example.com"], "cc": null, "bcc": null, "subject": "Draft subject", "body": "Full draft body text", "in_reply_to": null, "references": null, "error": null}
 ```
 
 ### POST /drafts/{draft_id}/update
@@ -409,7 +412,7 @@ curl -X POST http://localhost:8081/drafts/{draft_id}/update \
 
 Response:
 ```json
-{"success": true, "draft_id": "r1234567890", "message": "Draft updated: r1234567890", "error": null}
+{"success": true, "draft_id": "r1234567890", "thread_id": "18d5a3b2c4e5f001", "thread_attached": true, "message": "Draft updated: r1234567890", "error": null}
 ```
 
 ### DELETE /drafts/{draft_id}
