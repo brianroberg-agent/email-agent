@@ -14,6 +14,7 @@ import os
 import re
 import sys
 from contextlib import asynccontextmanager
+from email.header import decode_header, make_header
 from enum import Enum
 from typing import NamedTuple, Optional
 
@@ -700,6 +701,63 @@ def build_draft_message(request: "DraftRequest") -> str:
     )
 
 
+def _decoded_header_text(value: str) -> str:
+    """Decode an RFC 2047 encoded-word header value to plain text, with
+    whitespace normalized.
+
+    Gmail echoes a non-ASCII Subject back as an encoded-word (e.g.
+    'Café meeting' -> '=?utf-8?q?Caf=C3=A9_meeting?='), not as the literal
+    text that was sent, so a raw string comparison against the request
+    would flag every correct non-ASCII update as a mismatch. Falls back to
+    the raw value (still whitespace-normalized) if decoding fails, so a
+    malformed header degrades to the old plain-text behavior rather than
+    raising.
+    """
+    try:
+        decoded = str(make_header(decode_header(value)))
+    except (UnicodeDecodeError, LookupError, ValueError):
+        decoded = value
+    return " ".join(decoded.split())
+
+
+def draft_content_mismatch_note(result: Optional[dict], request: "DraftRequest") -> str:
+    """Cross-check an update result's embedded Subject header against the
+    request, when the proxy result actually embeds message headers.
+
+    Issue #3's Case 2 was a draft silently gutted to a different subject
+    behind a success-shaped response. Most proxy configurations return a
+    sparse update result with no embedded payload/headers, so absence of
+    headers here is not itself suspicious and yields no warning — this is
+    a best-effort check that costs no extra round-trip, not a guarantee.
+
+    Both sides are RFC 2047-decoded before comparing (see
+    _decoded_header_text) so a correct update with a non-ASCII subject
+    isn't flagged just because Gmail echoed it back encoded-word.
+
+    Returns a note fragment (empty string if nothing to report).
+    """
+    message = (result if isinstance(result, dict) else {}).get("message")
+    if not isinstance(message, dict):
+        return ""
+    payload = message.get("payload")
+    if not isinstance(payload, dict):
+        return ""
+    headers = payload.get("headers")
+    if not isinstance(headers, list):
+        return ""
+    returned_subject = get_header(headers, "Subject")
+    if not returned_subject:
+        return ""
+    decoded_returned = _decoded_header_text(returned_subject)
+    if decoded_returned == _decoded_header_text(request.subject):
+        return ""
+    return (
+        f" (warning: draft content mismatch — requested subject "
+        f"{request.subject!r} but the update result's Subject header is "
+        f"{decoded_returned!r})"
+    )
+
+
 def draft_success_response(
     result: Optional[dict],
     draft_id: Optional[str],
@@ -1239,7 +1297,23 @@ async def update_draft(draft_id: str, request: DraftRequest):
 
         result = await client.update_draft(draft_id, raw_message, thread_id=thread_id)
 
-        return draft_success_response(result, draft_id, thread_id, thread_note, "updated")
+        # Cross-check identity: issue #3's leading suspicion for a stale-id
+        # failure was drafts.update reissuing a new id. Never trust the
+        # requested path id as the current one without checking the result.
+        returned_id = (result or {}).get("id")
+        effective_draft_id = returned_id or draft_id
+        if returned_id and returned_id != draft_id:
+            thread_note += (
+                f" (warning: proxy returned draft id {returned_id} instead "
+                f"of requested {draft_id} — Gmail's drafts.update may have "
+                f"reissued the id; use {returned_id} for future calls)"
+            )
+
+        thread_note += draft_content_mismatch_note(result, request)
+
+        return draft_success_response(
+            result, effective_draft_id, thread_id, thread_note, "updated"
+        )
 
     except ValueError as e:
         return DraftResponse(success=False, message="", error=str(e))
