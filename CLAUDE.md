@@ -91,6 +91,7 @@ Copy `.env.example` to `.env` and configure:
 - `MLX_URL` - Local LLM endpoint (default: `http://localhost:8080/v1/chat/completions`)
 - `MLX_MODEL` - Model name (default: `qwen/qwen3-14b`)
 - `LLM_MAX_TOKENS` - Token budget per LLM completion, reasoning + answer (default: `4096`)
+- `LLM_BACKEND_NAME` - Product name of the server behind `MLX_URL`, used only in diagnostic/error text (default: `Ollama`)
 
 ## Proxy Server
 

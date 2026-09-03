@@ -942,8 +942,9 @@ class TestCallLocalLLM:
             with pytest.raises(LLMUnreachableError) as exc_info:
                 await call_local_llm("System prompt", "User content")
             msg = str(exc_info.value)
-            assert "Cannot reach MLX server at" in msg
-            assert "LM Studio" in msg
+            assert "Cannot reach the LLM backend at" in msg
+            assert "Ollama" in msg
+            assert "LM Studio" not in msg
             assert "All connection attempts failed" in msg
 
     @pytest.mark.asyncio
@@ -1270,7 +1271,7 @@ class TestCallLocalLLM:
             with pytest.raises(LLMUnreachableError) as exc_info:
                 await call_local_llm("System prompt", "User content")
             msg = str(exc_info.value)
-            assert "Cannot reach MLX server at" in msg
+            assert "Cannot reach the LLM backend at" in msg
             assert "tailscale ping" in msg
 
     @pytest.mark.asyncio
@@ -1291,8 +1292,8 @@ class TestCallLocalLLM:
         "exc_name", ["ReadError", "WriteError", "RemoteProtocolError"]
     )
     async def test_call_local_llm_wraps_mid_request_transport_errors(self, exc_name):
-        """A crash mid-request (LM Studio dying, connection drop) must surface
-        as an actionable LLM error, not a bare httpx exception name."""
+        """A crash mid-request (the LLM backend dying, connection drop) must
+        surface as an actionable LLM error, not a bare httpx exception name."""
         import httpx
         from email_server import call_local_llm, LLMUnreachableError
 
@@ -1410,6 +1411,58 @@ class TestLLMConfig:
             assert email_server.LLM_MAX_TOKENS == 1234
         finally:
             monkeypatch.delenv("LLM_MAX_TOKENS", raising=False)
+            importlib.reload(email_server)
+
+    def test_llm_backend_name_defaults_to_ollama(self, monkeypatch):
+        """The real backend behind MLX_URL is Ollama (port 11434), not the
+        MLX/LM Studio-era default the error messages used to name."""
+        import importlib
+        import email_server
+
+        monkeypatch.delenv("LLM_BACKEND_NAME", raising=False)
+        try:
+            importlib.reload(email_server)
+            assert email_server.LLM_BACKEND_NAME == "Ollama"
+        finally:
+            importlib.reload(email_server)
+
+    def test_llm_backend_name_configurable_via_env(self, monkeypatch):
+        """Backend product name must be config-driven, not a hardcoded
+        string, so a future backend swap doesn't require another code fix."""
+        import importlib
+        import email_server
+
+        monkeypatch.setenv("LLM_BACKEND_NAME", "vLLM")
+        try:
+            importlib.reload(email_server)
+            assert email_server.LLM_BACKEND_NAME == "vLLM"
+        finally:
+            monkeypatch.delenv("LLM_BACKEND_NAME", raising=False)
+            importlib.reload(email_server)
+
+    @pytest.mark.asyncio
+    async def test_call_local_llm_connect_error_names_configured_backend(self, monkeypatch):
+        """The connection-error hint must name whatever backend is
+        configured via LLM_BACKEND_NAME, not a hardcoded product name."""
+        import importlib
+        import httpx
+
+        monkeypatch.setenv("LLM_BACKEND_NAME", "vLLM")
+        try:
+            import email_server
+            importlib.reload(email_server)
+
+            with patch.object(
+                httpx.AsyncClient, "post", new_callable=AsyncMock
+            ) as mock_post:
+                mock_post.side_effect = httpx.ConnectError("All connection attempts failed")
+                with pytest.raises(email_server.LLMUnreachableError) as exc_info:
+                    await email_server.call_local_llm("System prompt", "User content")
+                msg = str(exc_info.value)
+                assert "vLLM" in msg
+                assert "Ollama" not in msg
+        finally:
+            monkeypatch.delenv("LLM_BACKEND_NAME", raising=False)
             importlib.reload(email_server)
 
 
