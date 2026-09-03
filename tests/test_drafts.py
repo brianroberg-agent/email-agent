@@ -1367,6 +1367,106 @@ class TestUpdateDraftEndpoint:
         assert "warning" not in data["message"]
 
     @patch("email_server.get_gmail_client")
+    def test_update_draft_content_encoded_word_subject_no_warning(self, mock_get_client, client):
+        """Gmail echoes a non-ASCII Subject back as an RFC 2047 encoded-word
+        (e.g. 'Café meeting' -> '=?utf-8?q?Caf=C3=A9_meeting?='), not as the
+        literal UTF-8 text that was sent. A plain '==' comparison between
+        the two would treat a correct, unchanged update as a mismatch."""
+        mock_proxy = AsyncMock()
+        mock_get_client.return_value = mock_proxy
+        mock_proxy.update_draft.return_value = {
+            "id": "r123",
+            "message": {
+                "id": "msg456",
+                "threadId": "t_keep",
+                "payload": {
+                    "headers": [
+                        {"name": "Subject", "value": "=?utf-8?q?Caf=C3=A9_meeting?="},
+                    ]
+                },
+            },
+        }
+
+        response = client.post("/drafts/r123/update", json={
+            "to": ["bob@example.com"],
+            "subject": "Café meeting",
+            "body": "Updated body",
+        })
+
+        data = response.json()
+        assert data["success"] is True
+        assert "warning" not in data["message"]
+
+    @patch("email_server.get_gmail_client")
+    def test_update_draft_content_encoded_word_curly_quotes_em_dash_no_warning(self, mock_get_client, client):
+        """Same encoded-word issue, exercised with curly quotes and an em
+        dash -- characters common in dictated/pasted prose -- which Gmail
+        base64-encodes rather than quoted-printable-encodes."""
+        mock_proxy = AsyncMock()
+        mock_get_client.return_value = mock_proxy
+        mock_proxy.update_draft.return_value = {
+            "id": "r123",
+            "message": {
+                "id": "msg456",
+                "threadId": "t_keep",
+                "payload": {
+                    "headers": [
+                        {
+                            "name": "Subject",
+                            "value": "=?utf-8?b?UXVhcnRlcmx5IHJldmlldyDigJQg4oCcUTPigJ0gcGxhbm5pbmc=?=",
+                        },
+                    ]
+                },
+            },
+        }
+
+        response = client.post("/drafts/r123/update", json={
+            "to": ["bob@example.com"],
+            "subject": "Quarterly review — “Q3” planning",
+            "body": "Updated body",
+        })
+
+        data = response.json()
+        assert data["success"] is True
+        assert "warning" not in data["message"]
+
+    @patch("email_server.get_gmail_client")
+    def test_update_draft_content_genuinely_different_encoded_subject_still_warns(self, mock_get_client, client):
+        """Decoding both sides before comparing must not blunt the check --
+        a returned Subject that decodes to genuinely different text still
+        has to warn, even when both requested and returned subjects are
+        non-ASCII and therefore encoded-word on the wire."""
+        mock_proxy = AsyncMock()
+        mock_get_client.return_value = mock_proxy
+        mock_proxy.update_draft.return_value = {
+            "id": "r123",
+            "message": {
+                "id": "msg456",
+                "threadId": "t_keep",
+                "payload": {
+                    "headers": [
+                        {
+                            "name": "Subject",
+                            "value": "=?utf-8?q?R=C3=A9union_diff=C3=A9rente?=",
+                        },
+                    ]
+                },
+            },
+        }
+
+        response = client.post("/drafts/r123/update", json={
+            "to": ["bob@example.com"],
+            "subject": "Café meeting",
+            "body": "Updated body",
+        })
+
+        data = response.json()
+        assert data["success"] is True
+        assert "warning" in data["message"]
+        assert "Café meeting" in data["message"]
+        assert "Réunion différente" in data["message"]
+
+    @patch("email_server.get_gmail_client")
     def test_update_draft_with_thread_id(self, mock_get_client, client):
         mock_proxy = AsyncMock()
         mock_get_client.return_value = mock_proxy

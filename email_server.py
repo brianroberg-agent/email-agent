@@ -14,6 +14,7 @@ import os
 import re
 import sys
 from contextlib import asynccontextmanager
+from email.header import decode_header, make_header
 from enum import Enum
 from typing import NamedTuple, Optional
 
@@ -694,6 +695,25 @@ def build_draft_message(request: "DraftRequest") -> str:
     )
 
 
+def _decoded_header_text(value: str) -> str:
+    """Decode an RFC 2047 encoded-word header value to plain text, with
+    whitespace normalized.
+
+    Gmail echoes a non-ASCII Subject back as an encoded-word (e.g.
+    'Café meeting' -> '=?utf-8?q?Caf=C3=A9_meeting?='), not as the literal
+    text that was sent, so a raw string comparison against the request
+    would flag every correct non-ASCII update as a mismatch. Falls back to
+    the raw value (still whitespace-normalized) if decoding fails, so a
+    malformed header degrades to the old plain-text behavior rather than
+    raising.
+    """
+    try:
+        decoded = str(make_header(decode_header(value)))
+    except (UnicodeDecodeError, LookupError, ValueError):
+        decoded = value
+    return " ".join(decoded.split())
+
+
 def draft_content_mismatch_note(result: Optional[dict], request: "DraftRequest") -> str:
     """Cross-check an update result's embedded Subject header against the
     request, when the proxy result actually embeds message headers.
@@ -703,6 +723,10 @@ def draft_content_mismatch_note(result: Optional[dict], request: "DraftRequest")
     sparse update result with no embedded payload/headers, so absence of
     headers here is not itself suspicious and yields no warning — this is
     a best-effort check that costs no extra round-trip, not a guarantee.
+
+    Both sides are RFC 2047-decoded before comparing (see
+    _decoded_header_text) so a correct update with a non-ASCII subject
+    isn't flagged just because Gmail echoed it back encoded-word.
 
     Returns a note fragment (empty string if nothing to report).
     """
@@ -716,12 +740,15 @@ def draft_content_mismatch_note(result: Optional[dict], request: "DraftRequest")
     if not isinstance(headers, list):
         return ""
     returned_subject = get_header(headers, "Subject")
-    if not returned_subject or returned_subject == request.subject:
+    if not returned_subject:
+        return ""
+    decoded_returned = _decoded_header_text(returned_subject)
+    if decoded_returned == _decoded_header_text(request.subject):
         return ""
     return (
         f" (warning: draft content mismatch — requested subject "
         f"{request.subject!r} but the update result's Subject header is "
-        f"{returned_subject!r})"
+        f"{decoded_returned!r})"
     )
 
 
