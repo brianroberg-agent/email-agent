@@ -681,6 +681,83 @@ class TestApplyLabelEndpoint:
         })
         assert response.status_code == 500
 
+    @patch("email_server.get_gmail_client")
+    @pytest.mark.parametrize("label", ["TRASH", "SPAM", "trash", "Spam"])
+    def test_apply_label_rejects_trash_and_spam(self, mock_get_client, client, label):
+        """TRASH/SPAM via /apply-label bypasses the proxy's approval gate
+        (api-proxy#2). Reject it here in defense-in-depth and point the
+        caller at the sanctioned /trash route instead."""
+        mock_proxy_client = AsyncMock()
+        mock_get_client.return_value = mock_proxy_client
+
+        response = client.post("/apply-label", json={
+            "email_id": "msg123",
+            "label_name": label,
+        })
+        assert response.status_code == 400
+        assert "/trash" in response.json()["detail"]
+        mock_proxy_client.modify_message.assert_not_called()
+
+
+class TestTrashEndpoint:
+    """Tests for the /trash endpoint."""
+
+    @patch("email_server.get_gmail_client")
+    def test_trash_success(self, mock_get_client, client):
+        mock_proxy_client = AsyncMock()
+        mock_get_client.return_value = mock_proxy_client
+        mock_proxy_client.trash_message.return_value = {"id": "msg123", "labelIds": ["TRASH"]}
+
+        response = client.post("/trash", json={"email_id": "msg123"})
+        assert response.status_code == 200
+
+        data = response.json()
+        assert data["success"] is True
+        mock_proxy_client.trash_message.assert_called_once_with("msg123")
+
+    @patch("email_server.get_gmail_client")
+    def test_trash_handles_error(self, mock_get_client, client):
+        mock_proxy_client = AsyncMock()
+        mock_get_client.return_value = mock_proxy_client
+        mock_proxy_client.trash_message.side_effect = Exception("Connection error")
+
+        response = client.post("/trash", json={"email_id": "msg123"})
+        assert response.status_code == 500
+
+    def test_trash_requires_email_id(self, client):
+        response = client.post("/trash", json={})
+        assert response.status_code == 422
+
+
+class TestUntrashEndpoint:
+    """Tests for the /untrash endpoint."""
+
+    @patch("email_server.get_gmail_client")
+    def test_untrash_success(self, mock_get_client, client):
+        mock_proxy_client = AsyncMock()
+        mock_get_client.return_value = mock_proxy_client
+        mock_proxy_client.untrash_message.return_value = {"id": "msg123", "labelIds": ["INBOX"]}
+
+        response = client.post("/untrash", json={"email_id": "msg123"})
+        assert response.status_code == 200
+
+        data = response.json()
+        assert data["success"] is True
+        mock_proxy_client.untrash_message.assert_called_once_with("msg123")
+
+    @patch("email_server.get_gmail_client")
+    def test_untrash_handles_error(self, mock_get_client, client):
+        mock_proxy_client = AsyncMock()
+        mock_get_client.return_value = mock_proxy_client
+        mock_proxy_client.untrash_message.side_effect = Exception("Connection error")
+
+        response = client.post("/untrash", json={"email_id": "msg123"})
+        assert response.status_code == 500
+
+    def test_untrash_requires_email_id(self, client):
+        response = client.post("/untrash", json={})
+        assert response.status_code == 422
+
 
 class TestArchiveEndpoint:
     """Tests for the /archive endpoint."""
@@ -1709,6 +1786,28 @@ class TestBulkActionsEndpoint:
         assert data["success"] is True
         call_kwargs = mock_proxy_client.modify_message.call_args[1]
         assert call_kwargs["add_label_ids"] == ["IMPORTANT"]
+
+    @patch("email_server.get_gmail_client")
+    @pytest.mark.parametrize("label", ["TRASH", "SPAM", "trash"])
+    def test_bulk_actions_apply_label_rejects_trash_and_spam(self, mock_get_client, client, label):
+        """The same TRASH/SPAM guard as /apply-label must hold here too --
+        apply_label:TRASH via bulk-actions is the same approval-gate bypass
+        under a different endpoint."""
+        mock_proxy_client = AsyncMock()
+        mock_get_client.return_value = mock_proxy_client
+
+        response = client.post("/bulk-actions", json={
+            "actions": [
+                {"email_id": "msg123", "operations": [f"apply_label:{label}"]}
+            ]
+        })
+        data = response.json()
+
+        assert data["success"] is True  # overall request always 200s
+        assert data["error_count"] == 1
+        assert data["results"][0]["success"] is False
+        assert "/trash" in data["results"][0]["error"]
+        mock_proxy_client.modify_message.assert_not_called()
 
     @patch("email_server.get_gmail_client")
     def test_bulk_actions_multiple_operations_per_email(self, mock_get_client, client):

@@ -243,6 +243,12 @@ Response:
 {"success": true, "message": "Label 'STARRED' applied"}
 ```
 
+**TRASH and SPAM are rejected here (400)** — applying either via the label-modify path bypasses the proxy's approval gate for destructive operations. Use `POST /trash` (or `POST /untrash`) instead, which routes through the proxy's gated trash endpoint. The same rejection applies to `apply_label:TRASH`/`apply_label:SPAM` operations passed to `/bulk-actions`.
+
+```json
+{"detail": "apply_label cannot be used for 'TRASH' — this bypasses the proxy's approval gate for destructive operations. Use POST /trash (or /untrash) instead."}
+```
+
 ### POST /archive
 
 Archive an email by removing it from the inbox.
@@ -256,6 +262,36 @@ curl -X POST http://localhost:8081/archive \
 Response:
 ```json
 {"success": true, "message": "Email archived"}
+```
+
+### POST /trash
+
+Move an email to Trash. This is the sanctioned, recoverable delete path — it calls the proxy's approval-gated `.../messages/{id}/trash` route (Gmail's `users.messages.trash`), unlike applying the `TRASH` label via `/apply-label`, which is rejected (see above). Trashed messages remain recoverable in Gmail for 30 days.
+
+```bash
+curl -X POST http://localhost:8081/trash \
+  -H "Content-Type: application/json" \
+  -d '{"email_id": "18d5a3b2c4e5f6a7"}'
+```
+
+Response:
+```json
+{"success": true, "message": "Email moved to Trash"}
+```
+
+### POST /untrash
+
+Remove an email from Trash, restoring it to its prior labels.
+
+```bash
+curl -X POST http://localhost:8081/untrash \
+  -H "Content-Type: application/json" \
+  -d '{"email_id": "18d5a3b2c4e5f6a7"}'
+```
+
+Response:
+```json
+{"success": true, "message": "Email removed from Trash"}
 ```
 
 ### POST /batch-summarize

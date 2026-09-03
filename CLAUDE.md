@@ -72,8 +72,10 @@ The test suite uses mocked proxy client and LLM responses - no credentials requi
 - `POST /summarize` - Summarize an email (uses local LLM)
 - `POST /ask-about` - Ask a question about an email (uses local LLM)
 - `POST /mark-read` - Mark email as read
-- `POST /apply-label` - Apply a label to an email
+- `POST /apply-label` - Apply a label to an email (rejects TRASH/SPAM — use /trash instead, which routes through the proxy's approval gate)
 - `POST /archive` - Archive an email
+- `POST /trash` - Move an email to Trash via the proxy's gated trash route (the sanctioned delete path)
+- `POST /untrash` - Remove an email from Trash
 - `POST /batch-summarize` - Summarize multiple emails with triage info (detected_action, detected_deadline)
 - `POST /bulk-actions` - Apply multiple operations to multiple emails
 - `POST /drafts/create` - Create a new email draft from structured fields (reply drafts auto-attach to the original Gmail thread via `in_reply_to`/`references` resolution)

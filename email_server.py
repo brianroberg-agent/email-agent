@@ -761,6 +761,25 @@ async def resolve_label_id(client, label_name: str) -> str:
     raise ValueError(f"Label '{label_name}' not found")
 
 
+# Applying TRASH/SPAM via the label-modify path bypasses the proxy's
+# approval gate for destructive operations (see api-proxy#2) — /trash and
+# /untrash are the sanctioned, gated equivalents. Reject these labels
+# wherever apply_label is reachable (both the dedicated route and the
+# bulk-actions per-operation path) rather than in one place only.
+TRASH_SPAM_LABELS = {"TRASH", "SPAM"}
+
+
+def trash_spam_label_rejection(label_name: str) -> Optional[str]:
+    """Error text for a TRASH/SPAM apply_label attempt, or None if allowed."""
+    if label_name.upper() not in TRASH_SPAM_LABELS:
+        return None
+    return (
+        f"apply_label cannot be used for '{label_name}' — this bypasses the "
+        f"proxy's approval gate for destructive operations. Use POST /trash "
+        f"(or /untrash) instead."
+    )
+
+
 async def apply_single_operation(client, email_id: str, operation: str) -> tuple[bool, str]:
     """Apply one operation to an email.
 
@@ -781,6 +800,9 @@ async def apply_single_operation(client, email_id: str, operation: str) -> tuple
             label_name = operation.split(":", 1)[1]
             if not label_name:
                 return False, "apply_label requires a label name (e.g., 'apply_label:IMPORTANT')"
+            rejection = trash_spam_label_rejection(label_name)
+            if rejection:
+                return False, rejection
             label_id = await resolve_label_id(client, label_name)
             await client.modify_message(email_id, add_label_ids=[label_id])
         else:
@@ -938,7 +960,14 @@ async def mark_read(request: EmailIdRequest):
 
 @app.post("/apply-label", response_model=ActionResponse)
 async def apply_label(request: ApplyLabelRequest):
-    """Apply a label to an email."""
+    """Apply a label to an email.
+
+    TRASH and SPAM are rejected here — see POST /trash and POST /untrash,
+    which route through the proxy's approval-gated trash endpoint instead.
+    """
+    rejection = trash_spam_label_rejection(request.label_name)
+    if rejection:
+        raise HTTPException(status_code=400, detail=rejection)
     try:
         client = get_gmail_client()
         label_id = await resolve_label_id(client, request.label_name)
@@ -958,6 +987,37 @@ async def archive(request: EmailIdRequest):
         client = get_gmail_client()
         await client.modify_message(request.email_id, remove_label_ids=["INBOX"])
         return ActionResponse(success=True, message="Email archived")
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=format_proxy_error(e))
+
+
+@app.post("/trash", response_model=ActionResponse)
+async def trash(request: EmailIdRequest):
+    """Move an email to Trash.
+
+    This is the sanctioned, recoverable delete path: it calls the proxy's
+    approval-gated .../messages/{id}/trash route (Gmail's users.messages.trash),
+    unlike applying the TRASH label via /apply-label, which is rejected
+    because it bypasses that gate (see api-proxy#2). Trashed messages remain
+    recoverable in Gmail for 30 days; use POST /untrash to restore one.
+    """
+    try:
+        client = get_gmail_client()
+        await client.trash_message(request.email_id)
+        return ActionResponse(success=True, message="Email moved to Trash")
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=format_proxy_error(e))
+
+
+@app.post("/untrash", response_model=ActionResponse)
+async def untrash(request: EmailIdRequest):
+    """Remove an email from Trash, restoring it to its prior labels."""
+    try:
+        client = get_gmail_client()
+        await client.untrash_message(request.email_id)
+        return ActionResponse(success=True, message="Email removed from Trash")
 
     except Exception as e:
         raise HTTPException(status_code=500, detail=format_proxy_error(e))
