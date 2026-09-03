@@ -56,6 +56,7 @@ No separate install step needed. The `uv run` command automatically manages depe
 | `MLX_URL` | No | `http://localhost:8080/v1/chat/completions` | Local LLM endpoint |
 | `MLX_MODEL` | No | `qwen/qwen3-14b` | Model name for LLM requests |
 | `LLM_MAX_TOKENS` | No | `4096` | Token budget per LLM completion (reasoning + answer) |
+| `LLM_BACKEND_NAME` | No | `Ollama` | Product name of the server behind `MLX_URL`, used only in diagnostic/error text (e.g. "Check that {name} is running") |
 
 ## Usage
 
