@@ -694,6 +694,37 @@ def build_draft_message(request: "DraftRequest") -> str:
     )
 
 
+def draft_content_mismatch_note(result: Optional[dict], request: "DraftRequest") -> str:
+    """Cross-check an update result's embedded Subject header against the
+    request, when the proxy result actually embeds message headers.
+
+    Issue #3's Case 2 was a draft silently gutted to a different subject
+    behind a success-shaped response. Most proxy configurations return a
+    sparse update result with no embedded payload/headers, so absence of
+    headers here is not itself suspicious and yields no warning — this is
+    a best-effort check that costs no extra round-trip, not a guarantee.
+
+    Returns a note fragment (empty string if nothing to report).
+    """
+    message = (result if isinstance(result, dict) else {}).get("message")
+    if not isinstance(message, dict):
+        return ""
+    payload = message.get("payload")
+    if not isinstance(payload, dict):
+        return ""
+    headers = payload.get("headers")
+    if not isinstance(headers, list):
+        return ""
+    returned_subject = get_header(headers, "Subject")
+    if not returned_subject or returned_subject == request.subject:
+        return ""
+    return (
+        f" (warning: draft content mismatch — requested subject "
+        f"{request.subject!r} but the update result's Subject header is "
+        f"{returned_subject!r})"
+    )
+
+
 def draft_success_response(
     result: Optional[dict],
     draft_id: Optional[str],
@@ -1233,7 +1264,23 @@ async def update_draft(draft_id: str, request: DraftRequest):
 
         result = await client.update_draft(draft_id, raw_message, thread_id=thread_id)
 
-        return draft_success_response(result, draft_id, thread_id, thread_note, "updated")
+        # Cross-check identity: issue #3's leading suspicion for a stale-id
+        # failure was drafts.update reissuing a new id. Never trust the
+        # requested path id as the current one without checking the result.
+        returned_id = (result or {}).get("id")
+        effective_draft_id = returned_id or draft_id
+        if returned_id and returned_id != draft_id:
+            thread_note += (
+                f" (warning: proxy returned draft id {returned_id} instead "
+                f"of requested {draft_id} — Gmail's drafts.update may have "
+                f"reissued the id; use {returned_id} for future calls)"
+            )
+
+        thread_note += draft_content_mismatch_note(result, request)
+
+        return draft_success_response(
+            result, effective_draft_id, thread_id, thread_note, "updated"
+        )
 
     except ValueError as e:
         return DraftResponse(success=False, message="", error=str(e))

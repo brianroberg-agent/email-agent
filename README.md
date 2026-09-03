@@ -415,6 +415,8 @@ Response:
 {"success": true, "draft_id": "r1234567890", "thread_id": "18d5a3b2c4e5f001", "thread_attached": true, "message": "Draft updated: r1234567890", "error": null}
 ```
 
+**Result verification:** the response is never a bare echo of the request. `draft_id` reports the id the proxy actually returned — if Gmail's `drafts.update` reissues a new id (it has), that new id is what comes back, with a `(warning: ...)` note in `message` naming both the requested and returned ids. When the update result embeds the message's headers, the Subject is also cross-checked against what was requested and a mismatch is flagged the same way. Still verify a change you care about with a follow-up `GET /drafts/{draft_id}` when it matters — this check catches identity/subject drift the proxy's response itself reveals, not everything that could go wrong server-side.
+
 ### DELETE /drafts/{draft_id}
 
 Delete a draft permanently.

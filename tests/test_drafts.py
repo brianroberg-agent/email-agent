@@ -1219,6 +1219,154 @@ class TestUpdateDraftEndpoint:
         assert "Updated subject" in decoded
 
     @patch("email_server.get_gmail_client")
+    def test_update_draft_id_mismatch_warns_and_reports_new_id(self, mock_get_client, client):
+        """Issue #3 documented drafts.update reissuing a new draft id while
+        the response still looked like a success. If that ever recurs, the
+        caller must be told the id changed and given the new one to use --
+        not silently handed back the stale id it asked for."""
+        mock_proxy = AsyncMock()
+        mock_get_client.return_value = mock_proxy
+        mock_proxy.update_draft.return_value = {
+            "id": "r999-new",
+            "message": {"id": "msg456", "threadId": "t_keep"},
+        }
+
+        response = client.post("/drafts/r123/update", json={
+            "to": ["bob@example.com"],
+            "subject": "Updated subject",
+            "body": "Updated body",
+        })
+
+        assert response.status_code == 200
+        data = response.json()
+        assert data["success"] is True
+        assert data["draft_id"] == "r999-new"
+        assert "r999-new" in data["message"]
+        assert "r123" in data["message"]
+        assert "warning" in data["message"]
+
+    @patch("email_server.get_gmail_client")
+    def test_update_draft_id_match_no_warning(self, mock_get_client, client):
+        """The common case -- proxy echoes back the same draft id -- must
+        not be flagged as a mismatch."""
+        mock_proxy = AsyncMock()
+        mock_get_client.return_value = mock_proxy
+        mock_proxy.update_draft.return_value = {
+            "id": "r123",
+            "message": {"id": "msg456", "threadId": "t_keep"},
+        }
+
+        response = client.post("/drafts/r123/update", json={
+            "to": ["bob@example.com"],
+            "subject": "Updated subject",
+            "body": "Updated body",
+        })
+
+        data = response.json()
+        assert data["draft_id"] == "r123"
+        assert "warning" not in data["message"]
+
+    @patch("email_server.get_gmail_client")
+    def test_update_draft_no_id_in_result_keeps_requested_id(self, mock_get_client, client):
+        """If the update result carries no id at all, fall back to the
+        requested path id rather than reporting None -- there's nothing to
+        compare against, so no mismatch warning either."""
+        mock_proxy = AsyncMock()
+        mock_get_client.return_value = mock_proxy
+        mock_proxy.update_draft.return_value = {"message": {"id": "msg456"}}
+
+        response = client.post("/drafts/r123/update", json={
+            "to": ["bob@example.com"],
+            "subject": "Updated subject",
+            "body": "Updated body",
+        })
+
+        data = response.json()
+        assert data["draft_id"] == "r123"
+        assert "warning" not in data["message"]
+
+    @patch("email_server.get_gmail_client")
+    def test_update_draft_content_mismatch_subject_warns(self, mock_get_client, client):
+        """Issue #3's Case 2 was a draft gutted to a different subject/body
+        behind a success response. When the update result embeds the
+        message's headers, cross-check the Subject against what was sent."""
+        mock_proxy = AsyncMock()
+        mock_get_client.return_value = mock_proxy
+        mock_proxy.update_draft.return_value = {
+            "id": "r123",
+            "message": {
+                "id": "msg456",
+                "threadId": "t_keep",
+                "payload": {
+                    "headers": [
+                        {"name": "Subject", "value": "Something else entirely"},
+                    ]
+                },
+            },
+        }
+
+        response = client.post("/drafts/r123/update", json={
+            "to": ["bob@example.com"],
+            "subject": "Updated subject",
+            "body": "Updated body",
+        })
+
+        data = response.json()
+        assert data["success"] is True
+        assert "warning" in data["message"]
+        assert "Updated subject" in data["message"]
+        assert "Something else entirely" in data["message"]
+
+    @patch("email_server.get_gmail_client")
+    def test_update_draft_content_match_subject_no_warning(self, mock_get_client, client):
+        """A result whose embedded Subject header matches the request must
+        not be flagged."""
+        mock_proxy = AsyncMock()
+        mock_get_client.return_value = mock_proxy
+        mock_proxy.update_draft.return_value = {
+            "id": "r123",
+            "message": {
+                "id": "msg456",
+                "threadId": "t_keep",
+                "payload": {
+                    "headers": [
+                        {"name": "Subject", "value": "Updated subject"},
+                    ]
+                },
+            },
+        }
+
+        response = client.post("/drafts/r123/update", json={
+            "to": ["bob@example.com"],
+            "subject": "Updated subject",
+            "body": "Updated body",
+        })
+
+        data = response.json()
+        assert data["success"] is True
+        assert "warning" not in data["message"]
+
+    @patch("email_server.get_gmail_client")
+    def test_update_draft_no_embedded_headers_no_content_warning(self, mock_get_client, client):
+        """A sparse update result with no embedded message headers cannot be
+        content-checked -- absence of headers is not itself suspicious, so
+        no warning should be raised (this is the shape most of the other
+        update tests' mocks already use)."""
+        mock_proxy = AsyncMock()
+        mock_get_client.return_value = mock_proxy
+        mock_proxy.update_draft.return_value = {"id": "r123"}
+
+        response = client.post("/drafts/r123/update", json={
+            "to": ["bob@example.com"],
+            "subject": "Updated subject",
+            "body": "Updated body",
+        })
+
+        data = response.json()
+        assert data["success"] is True
+        assert "warning" not in data["message"]
+
+    @patch("email_server.get_gmail_client")
     def test_update_draft_with_thread_id(self, mock_get_client, client):
         mock_proxy = AsyncMock()
         mock_get_client.return_value = mock_proxy
