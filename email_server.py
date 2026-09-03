@@ -14,7 +14,6 @@ import os
 import re
 import sys
 from contextlib import asynccontextmanager
-from email.header import decode_header, make_header
 from enum import Enum
 from typing import NamedTuple, Optional
 
@@ -24,6 +23,7 @@ from pydantic import BaseModel, Field
 
 from gmail_utils import (
     get_header,
+    decode_header_text,
     decode_body,
     parse_address_list,
     parse_references,
@@ -333,6 +333,8 @@ class DraftResponse(BaseModel):
     thread_id: Optional[str] = Field(None, description="Gmail thread the draft's message lives in (a standalone draft gets its own fresh thread)")
     thread_attached: bool = Field(False, description="True when a Gmail thread was set on the draft's message (explicit thread_id, in_reply_to/references resolution on create, or an update preserving the draft's current thread) and the result does not contradict it")
     message: str
+    warnings: list[str] = Field(default_factory=list, description="Machine-readable copies of every '(warning: ...)' note in message: thread lookup/attachment problems, a reissued or unconfirmed draft id, a content mismatch found by the post-update read-back, or a read-back that could not be performed. Empty when the result was verified clean")
+    id_changed: bool = Field(False, description="True when the proxy returned a different draft id than the one requested on update (Gmail's drafts.update reissued it); draft_id then carries the new id to use for future calls")
     error: Optional[str] = None
 
 
@@ -597,12 +599,29 @@ async def resolve_thread_id(client, msgid: str) -> Optional[str]:
     return messages[0].get("threadId") or None
 
 
+def draft_message(resource) -> dict:
+    """The embedded message of a draft resource, or {} for any other shape."""
+    message = (resource if isinstance(resource, dict) else {}).get("message")
+    return message if isinstance(message, dict) else {}
+
+
 def draft_message_thread_id(resource) -> Optional[str]:
     """The threadId of a draft resource's embedded message, if any."""
-    message = (resource if isinstance(resource, dict) else {}).get("message")
-    if not isinstance(message, dict):
+    return draft_message(resource).get("threadId") or None
+
+
+def draft_result_id(result) -> Optional[str]:
+    """The draft id a proxy create/update result carries, as a string, or
+    None when the result has no usable id (including a non-dict result).
+
+    Stringified so an id the proxy happens to return as a non-string
+    neither fails response validation nor reads as a spurious reissue when
+    compared with the str path parameter.
+    """
+    raw = (result if isinstance(result, dict) else {}).get("id")
+    if raw is None or raw == "":
         return None
-    return message.get("threadId") or None
+    return str(raw)
 
 
 async def resolve_draft_thread(
@@ -624,18 +643,18 @@ async def resolve_draft_thread(
     only truthful signal and moving a draft must be explicit.
 
     Returns:
-        (thread_id, note): note explains any degradation and is appended
-        to the response message.
+        (thread_id, warnings): warnings explain any degradation; each
+        lands in the response's warnings list and its message.
     """
     if request.thread_id:
-        return request.thread_id, ""
+        return request.thread_id, []
 
     if not request.attach_to_thread:
-        return None, ""
+        return None, []
 
     if existing_draft_id is not None:
         current = await client.get_draft(existing_draft_id, format="minimal")
-        return draft_message_thread_id(current), ""
+        return draft_message_thread_id(current), []
 
     candidates = list(extract_message_ids(request.in_reply_to or ""))
     for ref in reversed(request.references or []):
@@ -663,16 +682,13 @@ async def resolve_draft_thread(
             reason = f"thread lookup failed: {format_proxy_error(e)}"
             continue
         if resolved:
-            return resolved, ""
+            return resolved, []
     if msgids and reason is None:
         reason = "could not find the message being replied to"
 
     if reason:
-        return None, (
-            f" (warning: {reason}; "
-            f"draft is not attached to its Gmail conversation)"
-        )
-    return None, ""
+        return None, [f"{reason}; draft is not attached to its Gmail conversation"]
+    return None, []
 
 
 def build_draft_message(request: "DraftRequest") -> str:
@@ -701,69 +717,62 @@ def build_draft_message(request: "DraftRequest") -> str:
     )
 
 
-def _decoded_header_text(value: str) -> str:
-    """Decode an RFC 2047 encoded-word header value to plain text, with
-    whitespace normalized.
-
-    Gmail echoes a non-ASCII Subject back as an encoded-word (e.g.
-    'Café meeting' -> '=?utf-8?q?Caf=C3=A9_meeting?='), not as the literal
-    text that was sent, so a raw string comparison against the request
-    would flag every correct non-ASCII update as a mismatch. Falls back to
-    the raw value (still whitespace-normalized) if decoding fails, so a
-    malformed header degrades to the old plain-text behavior rather than
-    raising.
-    """
-    try:
-        decoded = str(make_header(decode_header(value)))
-    except (UnicodeDecodeError, LookupError, ValueError):
-        decoded = value
-    return " ".join(decoded.split())
-
-
-def draft_content_mismatch_note(result: Optional[dict], request: "DraftRequest") -> str:
-    """Cross-check an update result's embedded Subject header against the
-    request, when the proxy result actually embeds message headers.
+def draft_content_warnings(current, request: "DraftRequest") -> list[str]:
+    """Cross-check a draft resource read back after an update against the
+    request. `current` is the GET /drafts/{id}?format=metadata result,
+    whose embedded message carries the stored headers.
 
     Issue #3's Case 2 was a draft silently gutted to a different subject
-    behind a success-shaped response. Most proxy configurations return a
-    sparse update result with no embedded payload/headers, so absence of
-    headers here is not itself suspicious and yields no warning — this is
-    a best-effort check that costs no extra round-trip, not a guarantee.
+    behind a success-shaped response; a Subject that is blank or missing
+    while other headers are present is exactly that case and warns. A
+    read-back with no headers at all cannot verify anything and says so
+    rather than passing silently.
 
-    Both sides are RFC 2047-decoded before comparing (see
-    _decoded_header_text) so a correct update with a non-ASCII subject
-    isn't flagged just because Gmail echoed it back encoded-word.
+    The stored Subject is RFC 2047-decoded and both sides normalised (see
+    gmail_utils.decode_header_text) so a correct non-ASCII update is not
+    flagged merely because it came back encoded-word.
 
-    Returns a note fragment (empty string if nothing to report).
+    Never raises: this runs after Gmail applied the write, so a surprise
+    in the read-back is reported as a warning, not as a failed update.
     """
-    message = (result if isinstance(result, dict) else {}).get("message")
-    if not isinstance(message, dict):
-        return ""
-    payload = message.get("payload")
-    if not isinstance(payload, dict):
-        return ""
-    headers = payload.get("headers")
-    if not isinstance(headers, list):
-        return ""
-    returned_subject = get_header(headers, "Subject")
-    if not returned_subject:
-        return ""
-    decoded_returned = _decoded_header_text(returned_subject)
-    if decoded_returned == _decoded_header_text(request.subject):
-        return ""
-    return (
-        f" (warning: draft content mismatch — requested subject "
-        f"{request.subject!r} but the update result's Subject header is "
-        f"{decoded_returned!r})"
-    )
+    try:
+        headers = draft_message(current).get("payload", {}).get("headers")
+        if not isinstance(headers, list) or not headers:
+            return ["could not verify draft content: the read-back carried no message headers"]
+        stored_subject = decode_header_text(get_header(headers, "Subject"))
+        if stored_subject == decode_header_text(request.subject):
+            return []
+        return [
+            f"draft content mismatch — requested subject {request.subject!r} "
+            f"but the stored draft's Subject header is now {stored_subject!r}"
+        ]
+    except Exception as e:  # pragma: no cover - belt and braces
+        return [f"could not verify draft content: {format_proxy_error(e)}"]
+
+
+async def verify_updated_draft(client, draft_id: str, request: "DraftRequest") -> list[str]:
+    """Read a draft back after an update and compare it with the request.
+
+    Gmail's drafts.update response (which the proxy forwards verbatim)
+    carries only ids, never the stored headers, so the only way to know
+    what the draft now says is to read it. Best-effort: a failed read is a
+    warning on a successful response, because the update itself landed
+    and reporting failure would invite a retry that duplicates it.
+    """
+    try:
+        current = await client.get_draft(draft_id, format="metadata")
+    except Exception as e:
+        return [f"could not verify draft content after update: {format_proxy_error(e)}"]
+    return draft_content_warnings(current, request)
 
 
 def draft_success_response(
-    result: Optional[dict],
+    result,
     draft_id: Optional[str],
     thread_id: Optional[str],
-    note: str,
+    warnings: list[str],
     action: str,
+    id_changed: bool = False,
 ) -> DraftResponse:
     """Build the success response shared by draft create and update.
 
@@ -772,21 +781,27 @@ def draft_success_response(
     thread_attached is true only when a thread was requested and the
     result does not contradict it. A contradiction also gets a warning:
     it means the proxy or Gmail ignored the requested threadId.
+
+    Every warning is reported twice: structurally in `warnings`, and as a
+    "(warning: ...)" note appended to `message` for existing readers.
     """
     actual = draft_message_thread_id(result)
+    warnings = list(warnings)
     if thread_id is not None and actual is not None and actual != thread_id:
-        note += (
-            f" (warning: draft landed in thread {actual} instead of "
-            f"requested {thread_id} — the proxy or Gmail may have ignored "
-            f"threadId)"
+        warnings.append(
+            f"draft landed in thread {actual} instead of requested "
+            f"{thread_id} — the proxy or Gmail may have ignored threadId"
         )
+    notes = "".join(f" (warning: {w})" for w in warnings)
     return DraftResponse(
         success=True,
         draft_id=draft_id,
         thread_id=actual or thread_id,
         thread_attached=thread_id is not None
         and (actual is None or actual == thread_id),
-        message=f"Draft {action}: {draft_id}{note}",
+        message=f"Draft {action}: {draft_id}{notes}",
+        warnings=warnings,
+        id_changed=id_changed,
     )
 
 
@@ -1234,7 +1249,7 @@ async def create_draft(request: DraftRequest):
         raw_message = build_draft_message(request)
 
         client = get_gmail_client()
-        thread_id, thread_note = await resolve_draft_thread(client, request)
+        thread_id, warnings = await resolve_draft_thread(client, request)
 
         try:
             result = await client.create_draft(raw_message, thread_id=thread_id)
@@ -1247,19 +1262,19 @@ async def create_draft(request: DraftRequest):
             # rejection applies to the draft itself.)
             result = await client.create_draft(raw_message, thread_id=None)
             thread_id = None
-            thread_note = (
-                " (warning: Gmail rejected attaching to the resolved thread; "
-                "draft created standalone)"
-            )
+            warnings = [
+                "Gmail rejected attaching to the resolved thread; "
+                "draft created standalone"
+            ]
 
-        new_draft_id = (result or {}).get("id")
+        new_draft_id = draft_result_id(result)
         if not new_draft_id:
             return DraftResponse(
                 success=False,
                 message="",
                 error="Proxy returned an unexpected create-draft response with no draft id",
             )
-        return draft_success_response(result, new_draft_id, thread_id, thread_note, "created")
+        return draft_success_response(result, new_draft_id, thread_id, warnings, "created")
 
     except ValueError as e:
         return DraftResponse(success=False, message="", error=str(e))
@@ -1351,28 +1366,41 @@ async def update_draft(draft_id: str, request: DraftRequest):
         raw_message = build_draft_message(request)
 
         client = get_gmail_client()
-        thread_id, thread_note = await resolve_draft_thread(
+        thread_id, warnings = await resolve_draft_thread(
             client, request, existing_draft_id=draft_id
         )
 
         result = await client.update_draft(draft_id, raw_message, thread_id=thread_id)
 
+        # Everything below runs after Gmail applied the write. Nothing here
+        # may turn the response into a failure: a caller told "failed"
+        # about an update that landed retries it and duplicates the work.
+
         # Cross-check identity: issue #3's leading suspicion for a stale-id
         # failure was drafts.update reissuing a new id. Never trust the
         # requested path id as the current one without checking the result.
-        returned_id = (result or {}).get("id")
+        returned_id = draft_result_id(result)
+        id_changed = returned_id is not None and returned_id != draft_id
         effective_draft_id = returned_id or draft_id
-        if returned_id and returned_id != draft_id:
-            thread_note += (
-                f" (warning: proxy returned draft id {returned_id} instead "
-                f"of requested {draft_id} — Gmail's drafts.update may have "
-                f"reissued the id; use {returned_id} for future calls)"
+        if returned_id is None:
+            warnings.append(
+                f"proxy returned no draft id; assuming requested id "
+                f"{draft_id} is still current"
+            )
+        elif id_changed:
+            warnings.append(
+                f"proxy returned draft id {returned_id} instead of requested "
+                f"{draft_id} — Gmail's drafts.update may have reissued the "
+                f"id; use {returned_id} for future calls"
             )
 
-        thread_note += draft_content_mismatch_note(result, request)
+        # Cross-check content by reading the draft back: the PUT result
+        # never carries the stored headers, so this is the only check that
+        # can catch a gutted draft (issue #3 Case 2).
+        warnings.extend(await verify_updated_draft(client, effective_draft_id, request))
 
         return draft_success_response(
-            result, effective_draft_id, thread_id, thread_note, "updated"
+            result, effective_draft_id, thread_id, warnings, "updated", id_changed=id_changed
         )
 
     except ValueError as e:

@@ -2,11 +2,51 @@
 
 import base64
 import email
-from unittest.mock import patch, AsyncMock
+from unittest.mock import patch, AsyncMock, call
 
 import pytest
 
+from gmail_utils import decode_header_text, get_header
+from proxy_client import ProxyError
 from tests.conftest import SAMPLE_MESSAGES
+
+
+def _draft_resource(draft_id="r123", thread_id="t_keep", subject=None, headers=None):
+    """A Gmail draft resource as the proxy returns it.
+
+    subject=None (and headers=None) yields the sparse ``format=minimal``
+    shape used for the pre-update thread read; passing ``subject`` (or an
+    explicit ``headers`` list) yields the ``format=metadata`` shape with
+    embedded headers, as the post-update verification read sees it.
+    """
+    message = {"id": "msg456", "threadId": thread_id}
+    if headers is None and subject is not None:
+        headers = [{"name": "Subject", "value": subject}]
+    if headers is not None:
+        message["payload"] = {"headers": headers}
+    return {"id": draft_id, "message": message}
+
+
+def _update_proxy(mock_get_client, *, pre=None, put=None, post=None):
+    """Wire an AsyncMock proxy for the update path: ``pre`` is the
+    format=minimal read that preserves the draft's thread, ``put`` the
+    drafts.update result, ``post`` the format=metadata verification read
+    (an Exception instance is raised from that read)."""
+    mock_proxy = AsyncMock()
+    mock_get_client.return_value = mock_proxy
+    mock_proxy.get_draft.side_effect = [
+        pre if pre is not None else _draft_resource(),
+        post if post is not None else _draft_resource(subject="Updated subject"),
+    ]
+    mock_proxy.update_draft.return_value = put if put is not None else _draft_resource()
+    return mock_proxy
+
+
+UPDATE_BODY = {
+    "to": ["bob@example.com"],
+    "subject": "Updated subject",
+    "body": "Updated body",
+}
 
 
 # =============================================================================
@@ -1249,223 +1289,101 @@ class TestUpdateDraftEndpoint:
     def test_update_draft_id_match_no_warning(self, mock_get_client, client):
         """The common case -- proxy echoes back the same draft id -- must
         not be flagged as a mismatch."""
-        mock_proxy = AsyncMock()
-        mock_get_client.return_value = mock_proxy
-        mock_proxy.update_draft.return_value = {
-            "id": "r123",
-            "message": {"id": "msg456", "threadId": "t_keep"},
-        }
+        _update_proxy(mock_get_client)
 
-        response = client.post("/drafts/r123/update", json={
-            "to": ["bob@example.com"],
-            "subject": "Updated subject",
-            "body": "Updated body",
-        })
+        data = client.post("/drafts/r123/update", json=UPDATE_BODY).json()
 
-        data = response.json()
         assert data["draft_id"] == "r123"
         assert "warning" not in data["message"]
-
-    @patch("email_server.get_gmail_client")
-    def test_update_draft_no_id_in_result_keeps_requested_id(self, mock_get_client, client):
-        """If the update result carries no id at all, fall back to the
-        requested path id rather than reporting None -- there's nothing to
-        compare against, so no mismatch warning either."""
-        mock_proxy = AsyncMock()
-        mock_get_client.return_value = mock_proxy
-        mock_proxy.update_draft.return_value = {"message": {"id": "msg456"}}
-
-        response = client.post("/drafts/r123/update", json={
-            "to": ["bob@example.com"],
-            "subject": "Updated subject",
-            "body": "Updated body",
-        })
-
-        data = response.json()
-        assert data["draft_id"] == "r123"
-        assert "warning" not in data["message"]
-
     @patch("email_server.get_gmail_client")
     def test_update_draft_content_mismatch_subject_warns(self, mock_get_client, client):
         """Issue #3's Case 2 was a draft gutted to a different subject/body
-        behind a success response. When the update result embeds the
-        message's headers, cross-check the Subject against what was sent."""
-        mock_proxy = AsyncMock()
-        mock_get_client.return_value = mock_proxy
-        mock_proxy.update_draft.return_value = {
-            "id": "r123",
-            "message": {
-                "id": "msg456",
-                "threadId": "t_keep",
-                "payload": {
-                    "headers": [
-                        {"name": "Subject", "value": "Something else entirely"},
-                    ]
-                },
-            },
-        }
+        behind a success response. The draft is read back after the write
+        (format=metadata) and its Subject cross-checked against what was
+        sent."""
+        _update_proxy(mock_get_client, post=_draft_resource(subject="Something else entirely"))
 
-        response = client.post("/drafts/r123/update", json={
-            "to": ["bob@example.com"],
-            "subject": "Updated subject",
-            "body": "Updated body",
-        })
+        data = client.post("/drafts/r123/update", json=UPDATE_BODY).json()
 
-        data = response.json()
         assert data["success"] is True
         assert "warning" in data["message"]
         assert "Updated subject" in data["message"]
         assert "Something else entirely" in data["message"]
-
     @patch("email_server.get_gmail_client")
     def test_update_draft_content_match_subject_no_warning(self, mock_get_client, client):
-        """A result whose embedded Subject header matches the request must
-        not be flagged."""
-        mock_proxy = AsyncMock()
-        mock_get_client.return_value = mock_proxy
-        mock_proxy.update_draft.return_value = {
-            "id": "r123",
-            "message": {
-                "id": "msg456",
-                "threadId": "t_keep",
-                "payload": {
-                    "headers": [
-                        {"name": "Subject", "value": "Updated subject"},
-                    ]
-                },
-            },
-        }
+        """A read-back whose Subject header matches the request must not be
+        flagged."""
+        _update_proxy(mock_get_client, post=_draft_resource(subject="Updated subject"))
 
-        response = client.post("/drafts/r123/update", json={
-            "to": ["bob@example.com"],
-            "subject": "Updated subject",
-            "body": "Updated body",
-        })
+        data = client.post("/drafts/r123/update", json=UPDATE_BODY).json()
 
-        data = response.json()
         assert data["success"] is True
         assert "warning" not in data["message"]
-
     @patch("email_server.get_gmail_client")
-    def test_update_draft_no_embedded_headers_no_content_warning(self, mock_get_client, client):
-        """A sparse update result with no embedded message headers cannot be
-        content-checked -- absence of headers is not itself suspicious, so
-        no warning should be raised (this is the shape most of the other
-        update tests' mocks already use)."""
-        mock_proxy = AsyncMock()
-        mock_get_client.return_value = mock_proxy
-        mock_proxy.update_draft.return_value = {"id": "r123"}
+    def test_update_draft_sparse_put_result_is_fine_when_read_back_matches(self, mock_get_client, client):
+        """The PUT result is always sparse in production (Gmail's
+        drafts.update carries no payload); that is not itself suspicious
+        because verification comes from the read-back, not the echo."""
+        _update_proxy(mock_get_client, put={"id": "r123"})
 
-        response = client.post("/drafts/r123/update", json={
-            "to": ["bob@example.com"],
-            "subject": "Updated subject",
-            "body": "Updated body",
-        })
+        data = client.post("/drafts/r123/update", json=UPDATE_BODY).json()
 
-        data = response.json()
         assert data["success"] is True
         assert "warning" not in data["message"]
-
     @patch("email_server.get_gmail_client")
     def test_update_draft_content_encoded_word_subject_no_warning(self, mock_get_client, client):
-        """Gmail echoes a non-ASCII Subject back as an RFC 2047 encoded-word
-        (e.g. 'Café meeting' -> '=?utf-8?q?Caf=C3=A9_meeting?='), not as the
-        literal UTF-8 text that was sent. A plain '==' comparison between
-        the two would treat a correct, unchanged update as a mismatch."""
-        mock_proxy = AsyncMock()
-        mock_get_client.return_value = mock_proxy
-        mock_proxy.update_draft.return_value = {
-            "id": "r123",
-            "message": {
-                "id": "msg456",
-                "threadId": "t_keep",
-                "payload": {
-                    "headers": [
-                        {"name": "Subject", "value": "=?utf-8?q?Caf=C3=A9_meeting?="},
-                    ]
-                },
-            },
-        }
+        """A non-ASCII Subject may come back as an RFC 2047 encoded-word
+        (e.g. 'Café meeting' -> '=?utf-8?q?Caf=C3=A9_meeting?='), not as
+        the literal UTF-8 text that was sent. A plain '==' comparison
+        between the two would treat a correct, unchanged update as a
+        mismatch."""
+        _update_proxy(mock_get_client, post=_draft_resource(subject="=?utf-8?q?Caf=C3=A9_meeting?="))
 
-        response = client.post("/drafts/r123/update", json={
+        data = client.post("/drafts/r123/update", json={
             "to": ["bob@example.com"],
             "subject": "Café meeting",
             "body": "Updated body",
-        })
+        }).json()
 
-        data = response.json()
         assert data["success"] is True
         assert "warning" not in data["message"]
-
     @patch("email_server.get_gmail_client")
     def test_update_draft_content_encoded_word_curly_quotes_em_dash_no_warning(self, mock_get_client, client):
         """Same encoded-word issue, exercised with curly quotes and an em
-        dash -- characters common in dictated/pasted prose -- which Gmail
-        base64-encodes rather than quoted-printable-encodes."""
-        mock_proxy = AsyncMock()
-        mock_get_client.return_value = mock_proxy
-        mock_proxy.update_draft.return_value = {
-            "id": "r123",
-            "message": {
-                "id": "msg456",
-                "threadId": "t_keep",
-                "payload": {
-                    "headers": [
-                        {
-                            "name": "Subject",
-                            "value": "=?utf-8?b?UXVhcnRlcmx5IHJldmlldyDigJQg4oCcUTPigJ0gcGxhbm5pbmc=?=",
-                        },
-                    ]
-                },
-            },
-        }
+        dash -- characters common in dictated/pasted prose -- which get
+        base64-encoded rather than quoted-printable-encoded."""
+        _update_proxy(mock_get_client, post=_draft_resource(
+            subject="=?utf-8?b?UXVhcnRlcmx5IHJldmlldyDigJQg4oCcUTPigJ0gcGxhbm5pbmc=?=",
+        ))
 
-        response = client.post("/drafts/r123/update", json={
+        data = client.post("/drafts/r123/update", json={
             "to": ["bob@example.com"],
             "subject": "Quarterly review — “Q3” planning",
             "body": "Updated body",
-        })
+        }).json()
 
-        data = response.json()
         assert data["success"] is True
         assert "warning" not in data["message"]
-
     @patch("email_server.get_gmail_client")
     def test_update_draft_content_genuinely_different_encoded_subject_still_warns(self, mock_get_client, client):
-        """Decoding both sides before comparing must not blunt the check --
-        a returned Subject that decodes to genuinely different text still
-        has to warn, even when both requested and returned subjects are
-        non-ASCII and therefore encoded-word on the wire."""
-        mock_proxy = AsyncMock()
-        mock_get_client.return_value = mock_proxy
-        mock_proxy.update_draft.return_value = {
-            "id": "r123",
-            "message": {
-                "id": "msg456",
-                "threadId": "t_keep",
-                "payload": {
-                    "headers": [
-                        {
-                            "name": "Subject",
-                            "value": "=?utf-8?q?R=C3=A9union_diff=C3=A9rente?=",
-                        },
-                    ]
-                },
-            },
-        }
+        """Decoding before comparing must not blunt the check -- a stored
+        Subject that decodes to genuinely different text still has to warn,
+        even when both subjects are non-ASCII and therefore encoded-word on
+        the wire."""
+        _update_proxy(mock_get_client, post=_draft_resource(
+            subject="=?utf-8?q?R=C3=A9union_diff=C3=A9rente?=",
+        ))
 
-        response = client.post("/drafts/r123/update", json={
+        data = client.post("/drafts/r123/update", json={
             "to": ["bob@example.com"],
             "subject": "Café meeting",
             "body": "Updated body",
-        })
+        }).json()
 
-        data = response.json()
         assert data["success"] is True
         assert "warning" in data["message"]
         assert "Café meeting" in data["message"]
         assert "Réunion différente" in data["message"]
-
     @patch("email_server.get_gmail_client")
     def test_update_draft_with_thread_id(self, mock_get_client, client):
         mock_proxy = AsyncMock()
@@ -1483,22 +1401,15 @@ class TestUpdateDraftEndpoint:
         assert response.json()["success"] is True
         assert mock_proxy.update_draft.call_args.kwargs["thread_id"] == "thread_abc"
         mock_proxy.list_messages.assert_not_called()
-        mock_proxy.get_draft.assert_not_called()
+        # The current-thread read is skipped; the only get_draft call is the
+        # post-update verification read.
+        mock_proxy.get_draft.assert_called_once_with("r123", format="metadata")
 
     @patch("email_server.get_gmail_client")
     def test_update_draft_preserves_existing_thread_without_threading_fields(self, mock_get_client, client):
         """drafts.update replaces the whole message resource, so the current
         threadId is re-sent — a plain body edit never detaches the draft."""
-        mock_proxy = AsyncMock()
-        mock_get_client.return_value = mock_proxy
-        mock_proxy.get_draft.return_value = {
-            "id": "r123",
-            "message": {"id": "msg456", "threadId": "t_keep"},
-        }
-        mock_proxy.update_draft.return_value = {
-            "id": "r123",
-            "message": {"id": "msg456", "threadId": "t_keep"},
-        }
+        mock_proxy = _update_proxy(mock_get_client)
 
         response = client.post("/drafts/r123/update", json={
             "to": ["bob@example.com"],
@@ -1607,7 +1518,9 @@ class TestUpdateDraftEndpoint:
         assert data["thread_attached"] is False
         assert mock_proxy.update_draft.call_args.kwargs["thread_id"] is None
         mock_proxy.list_messages.assert_not_called()
-        mock_proxy.get_draft.assert_not_called()
+        # The current-thread read is skipped; the only get_draft call is the
+        # post-update verification read.
+        mock_proxy.get_draft.assert_called_once_with("r123", format="metadata")
 
     @patch("email_server.get_gmail_client")
     def test_update_draft_bare_in_reply_to_header_normalized(self, mock_get_client, client):
@@ -1698,6 +1611,298 @@ class TestUpdateDraftEndpoint:
             "subject": "Test",
         })
         assert response.status_code == 422
+
+    # -- post-merge review follow-ups (FINDINGS #11-1..#11-8, #11-10) ------
+
+    @patch("email_server.get_gmail_client")
+    def test_update_draft_verifies_content_with_metadata_read(self, mock_get_client, client):
+        """#11-5: the proxy's PUT result is Gmail's drafts.update response,
+        which never embeds headers, so a check against it is a no-op in
+        production. The content check must read the draft back
+        (GET /drafts/{id}?format=metadata) after the write and compare
+        THAT Subject -- a gutted draft is caught there, and only there."""
+        mock_proxy = _update_proxy(
+            mock_get_client,
+            post=_draft_resource(subject="Something else entirely"),
+        )
+
+        response = client.post("/drafts/r123/update", json=UPDATE_BODY)
+
+        data = response.json()
+        assert data["success"] is True
+        assert mock_proxy.get_draft.call_args_list[-1] == call("r123", format="metadata")
+        assert "warning" in data["message"]
+        assert "Updated subject" in data["message"]
+        assert "Something else entirely" in data["message"]
+        assert any("Something else entirely" in w for w in data["warnings"])
+
+    @patch("email_server.get_gmail_client")
+    def test_update_draft_put_result_headers_are_not_the_verification(self, mock_get_client, client):
+        """#11-5: headers embedded in the PUT result (if a proxy ever
+        added them) describe what was sent, not what is stored. A stale
+        Subject there must not raise a false alarm when the read-back
+        matches."""
+        _update_proxy(
+            mock_get_client,
+            put=_draft_resource(subject="Old subject from the echo"),
+            post=_draft_resource(subject="Updated subject"),
+        )
+
+        data = client.post("/drafts/r123/update", json=UPDATE_BODY).json()
+
+        assert data["success"] is True
+        assert data["warnings"] == []
+        assert "warning" not in data["message"]
+
+    @patch("email_server.get_gmail_client")
+    def test_update_draft_verification_read_failure_warns_not_fails(self, mock_get_client, client):
+        """The verification read is best-effort: Gmail already applied the
+        update, so a failed read-back must surface as a warning on a
+        successful response -- never as success=False, which would tell the
+        caller to retry (and duplicate) an update that landed."""
+        _update_proxy(mock_get_client, post=ProxyError("proxy 502"))
+
+        data = client.post("/drafts/r123/update", json=UPDATE_BODY).json()
+
+        assert data["success"] is True
+        assert data["draft_id"] == "r123"
+        assert any("could not verify" in w for w in data["warnings"])
+        assert "could not verify" in data["message"]
+
+    @pytest.mark.parametrize("bad", ["=?utf-8?b?A?=", "=?ütf-8?q?abc?="])
+    @patch("email_server.get_gmail_client")
+    def test_update_draft_malformed_encoded_word_subject_does_not_fail_update(
+        self, mock_get_client, client, bad
+    ):
+        """#11-1: a malformed RFC 2047 encoded-word in the stored Subject
+        raised HeaderParseError/CharsetError (email.errors, not in the old
+        except tuple) AFTER the write succeeded, flipping the whole update
+        to success=False. Decoding is best-effort and must never fail the
+        update; the undecodable value is compared raw and simply warns."""
+        _update_proxy(mock_get_client, post=_draft_resource(subject=bad))
+
+        data = client.post("/drafts/r123/update", json=UPDATE_BODY).json()
+
+        assert data["success"] is True, data
+        assert data["error"] is None
+        assert "warning" in data["message"]
+
+    @pytest.mark.parametrize(
+        "headers",
+        [
+            [None],
+            ["not a dict"],
+            [{"value": "Updated subject"}],
+            [{"name": "Subject"}],
+            [{"name": "Subject", "value": 5}],
+        ],
+    )
+    @patch("email_server.get_gmail_client")
+    def test_update_draft_header_shape_anomalies_do_not_fail_update(
+        self, mock_get_client, client, headers
+    ):
+        """#11-2: a non-dict header entry, a missing name/value key or a
+        non-string value raised KeyError/TypeError from get_header after
+        the write. Anomalous headers are skipped or stringified; the update
+        stays a success and the unverifiable Subject is warned about."""
+        _update_proxy(mock_get_client, post=_draft_resource(headers=headers))
+
+        data = client.post("/drafts/r123/update", json=UPDATE_BODY).json()
+
+        assert data["success"] is True, data
+        assert data["error"] is None
+        assert "warning" in data["message"]
+
+    @patch("email_server.get_gmail_client")
+    def test_update_draft_non_dict_result_does_not_fail_update(self, mock_get_client, client):
+        """#11-3: a truthy non-dict PUT result raised AttributeError on
+        .get('id') after the write. Treat it as 'no id returned'."""
+        _update_proxy(mock_get_client, put=["not", "a", "dict"])
+
+        data = client.post("/drafts/r123/update", json=UPDATE_BODY).json()
+
+        assert data["success"] is True, data
+        assert data["draft_id"] == "r123"
+
+    @patch("email_server.get_gmail_client")
+    def test_update_draft_int_id_matching_path_is_not_a_reissue(self, mock_get_client, client):
+        """#11-3: a non-str id in the result failed DraftResponse validation
+        (success=False after the write) and, compared to the str path id,
+        would have read as a spurious 'reissued' warning. Compare as
+        strings."""
+        _update_proxy(mock_get_client, put=_draft_resource(draft_id=123))
+
+        data = client.post("/drafts/123/update", json=UPDATE_BODY).json()
+
+        assert data["success"] is True, data
+        assert data["draft_id"] == "123"
+        assert data["id_changed"] is False
+        assert not any("reissued" in w for w in data["warnings"])
+
+    @pytest.mark.parametrize(
+        "headers",
+        [
+            [{"name": "To", "value": "bob@example.com"}],
+            [{"name": "Subject", "value": ""}],
+        ],
+    )
+    @patch("email_server.get_gmail_client")
+    def test_update_draft_blank_or_missing_subject_in_stored_draft_warns(
+        self, mock_get_client, client, headers
+    ):
+        """#11-4: headers present but Subject blank/missing is the gutted
+        draft issue #3 described -- the one case the check exists for. The
+        old code returned '' (no warning) exactly there."""
+        _update_proxy(mock_get_client, post=_draft_resource(headers=headers))
+
+        data = client.post("/drafts/r123/update", json=UPDATE_BODY).json()
+
+        assert data["success"] is True
+        assert any("content mismatch" in w for w in data["warnings"])
+        assert "Updated subject" in data["message"]
+
+    @patch("email_server.get_gmail_client")
+    def test_update_draft_verification_without_headers_warns_unverified(self, mock_get_client, client):
+        """A read-back that carries no headers at all cannot verify
+        anything; say so rather than reporting silence as a pass."""
+        _update_proxy(mock_get_client, post=_draft_resource())
+
+        data = client.post("/drafts/r123/update", json=UPDATE_BODY).json()
+
+        assert data["success"] is True
+        assert any("could not verify" in w for w in data["warnings"])
+
+    @patch("email_server.get_gmail_client")
+    def test_update_draft_no_id_in_result_warns(self, mock_get_client, client):
+        """#11-6: create fails hard on a result with no id; update silently
+        assumed the path id. Keep the path id (the write did land) but say
+        that the id is assumed, not confirmed."""
+        _update_proxy(mock_get_client, put={"message": {"id": "msg456"}})
+
+        data = client.post("/drafts/r123/update", json=UPDATE_BODY).json()
+
+        assert data["success"] is True
+        assert data["draft_id"] == "r123"
+        assert data["id_changed"] is False
+        assert any("no draft id" in w for w in data["warnings"])
+        assert "no draft id" in data["message"]
+
+    @patch("email_server.get_gmail_client")
+    def test_update_draft_id_change_exposed_as_structured_fields(self, mock_get_client, client):
+        """#11-7: warnings were free text inside `message` only. Expose
+        them as `warnings: list[str]` and the id reissue as
+        `id_changed: bool` so a caller can branch without parsing prose."""
+        mock_proxy = _update_proxy(
+            mock_get_client,
+            put=_draft_resource(draft_id="r999-new"),
+            post=_draft_resource(draft_id="r999-new", subject="Updated subject"),
+        )
+
+        data = client.post("/drafts/r123/update", json=UPDATE_BODY).json()
+
+        assert data["success"] is True
+        assert data["draft_id"] == "r999-new"
+        assert data["id_changed"] is True
+        assert len(data["warnings"]) == 1
+        assert "r999-new" in data["warnings"][0] and "r123" in data["warnings"][0]
+        # The verification read must use the id the draft actually has now.
+        assert mock_proxy.get_draft.call_args_list[-1] == call("r999-new", format="metadata")
+
+    @patch("email_server.get_gmail_client")
+    def test_update_draft_warnings_collects_every_source(self, mock_get_client, client):
+        """#11-7: every warning source lands in `warnings` (thread
+        contradiction and content mismatch here) and each is also echoed
+        in `message` for existing readers."""
+        _update_proxy(
+            mock_get_client,
+            put=_draft_resource(thread_id="t_other"),
+            post=_draft_resource(thread_id="t_other", subject="Gutted"),
+        )
+
+        data = client.post("/drafts/r123/update", json=UPDATE_BODY).json()
+
+        assert data["success"] is True
+        assert data["thread_attached"] is False
+        assert len(data["warnings"]) == 2
+        assert any("t_other" in w for w in data["warnings"])
+        assert any("Gutted" in w for w in data["warnings"])
+        assert data["message"].count("(warning:") == 2
+
+    @patch("email_server.get_gmail_client")
+    def test_update_draft_clean_response_has_empty_warnings(self, mock_get_client, client):
+        _update_proxy(mock_get_client)
+
+        data = client.post("/drafts/r123/update", json=UPDATE_BODY).json()
+
+        assert data["success"] is True
+        assert data["warnings"] == []
+        assert data["id_changed"] is False
+        assert data["message"] == "Draft updated: r123"
+
+
+# =============================================================================
+# HEADER DECODING / get_header HARDENING (FINDINGS #11-1, #11-2, #11-8, #11-10)
+# =============================================================================
+
+
+class TestHeaderTextDecoding:
+    """decode_header_text: RFC 2047 decoding + comparison normalisation."""
+
+    def test_encoded_word_followed_by_plain_chunk_has_no_synthetic_space(self):
+        """#11-8: email.header.make_header inserts a space between an
+        encoded chunk and an adjacent unencoded one ('Café -meeting'), so
+        a Subject where Gmail encoded only the non-ASCII run would falsely
+        mismatch the request."""
+        assert decode_header_text("=?utf-8?q?Caf=C3=A9?=-meeting") == decode_header_text("Café-meeting")
+
+    def test_encoded_word_followed_by_space_and_plain_chunk_keeps_the_space(self):
+        assert decode_header_text("=?utf-8?q?Caf=C3=A9?= meeting") == decode_header_text("Café meeting")
+
+    def test_nfd_and_nfc_forms_compare_equal(self):
+        """#11-8: 'é' as one code point vs 'e' + combining acute."""
+        assert decode_header_text("Café meeting") == decode_header_text("Café meeting")
+
+    def test_zero_width_format_characters_are_ignored(self):
+        """#11-8: a zero-width space/joiner is invisible and carries no
+        content; it must not turn a correct update into a mismatch."""
+        assert decode_header_text("Caf​é meeting") == decode_header_text("Café meeting")
+
+    def test_whitespace_runs_and_folding_are_collapsed(self):
+        """#11-10: the whitespace normalisation had no test (deleting it
+        kept the suite green). A folded/re-spaced header equals the
+        single-spaced request."""
+        assert decode_header_text("Updated \r\n\t  subject") == "Updated subject"
+        assert decode_header_text("  Updated subject  ") == "Updated subject"
+
+    @pytest.mark.parametrize("bad", ["=?utf-8?b?A?=", "=?ütf-8?q?abc?="])
+    def test_undecodable_value_falls_back_to_raw_text_without_raising(self, bad):
+        """#11-1/#11-10: HeaderParseError and CharsetError (email.errors)
+        escaped the old except tuple; and the fallback itself had no red
+        test. Any decode failure yields the normalised raw value."""
+        assert decode_header_text(bad) == bad
+
+    def test_plain_text_passes_through(self):
+        assert decode_header_text("Plain subject") == "Plain subject"
+
+
+class TestGetHeaderHardening:
+    """#11-2: get_header tolerates malformed header entries."""
+
+    def test_skips_non_dict_entries(self):
+        headers = [None, "junk", 7, {"name": "Subject", "value": "Hi"}]
+        assert get_header(headers, "Subject") == "Hi"
+
+    def test_skips_entries_missing_name(self):
+        assert get_header([{"value": "x"}, {"name": "Subject", "value": "Hi"}], "Subject") == "Hi"
+
+    def test_missing_value_reads_as_empty(self):
+        assert get_header([{"name": "Subject"}], "Subject") == ""
+
+    def test_non_string_value_is_stringified(self):
+        assert get_header([{"name": "Subject", "value": 5}], "Subject") == "5"
+
+    def test_none_headers_reads_as_absent(self):
+        assert get_header(None, "Subject") == ""
 
 
 # =============================================================================

@@ -6,6 +6,8 @@ They have no framework or authentication dependencies.
 
 import base64
 import re
+import unicodedata
+from email.header import decode_header
 from email.utils import formataddr, getaddresses
 from typing import Optional
 
@@ -104,20 +106,73 @@ def parse_address_list(header_value: str) -> list[str]:
     return [formataddr(pair) for pair in getaddresses([header_value]) if pair[0] or pair[1]]
 
 
-def get_header(headers: list, name: str) -> str:
+def get_header(headers: Optional[list], name: str) -> str:
     """Extract a header value from Gmail message headers.
+
+    Tolerates malformed entries -- a non-dict item, a missing 'name' or
+    'value', or a non-string value -- rather than raising: callers use this
+    on data returned by a remote service, and a header list that is merely
+    odd must not fail a request that has already succeeded.
 
     Args:
         headers: List of header dicts with 'name' and 'value' keys
         name: Header name to find (case-insensitive)
 
     Returns:
-        Header value or empty string if not found
+        Header value (stringified) or empty string if not found
     """
-    for header in headers:
-        if header["name"].lower() == name.lower():
-            return header["value"]
+    wanted = name.lower()
+    for header in headers or []:
+        if not isinstance(header, dict):
+            continue
+        if str(header.get("name", "")).lower() == wanted:
+            value = header.get("value")
+            return "" if value is None else str(value)
     return ""
+
+
+def normalize_header_text(value: str) -> str:
+    """Canonicalise header text for comparison, not display.
+
+    Unicode NFC (so 'é' as one code point equals 'e' + combining acute),
+    format characters dropped (zero-width space/joiner and the like are
+    invisible and carry no content), and whitespace runs -- including
+    header folding -- collapsed to single spaces.
+    """
+    text = unicodedata.normalize("NFC", str(value))
+    text = "".join(ch for ch in text if unicodedata.category(ch) != "Cf")
+    return " ".join(text.split())
+
+
+def decode_header_text(value: str) -> str:
+    """Decode an RFC 2047 encoded-word header value to comparable plain
+    text (see normalize_header_text for the normalisation applied).
+
+    A non-ASCII Subject may come back as an encoded-word (e.g.
+    'Café meeting' -> '=?utf-8?q?Caf=C3=A9_meeting?='), not as the literal
+    text that was sent, so a raw string comparison against the request
+    would flag every correct non-ASCII update as a mismatch.
+
+    Chunks are joined directly rather than via email.header.make_header,
+    which inserts a space between an encoded chunk and an adjacent
+    unencoded one ('=?utf-8?q?Caf=C3=A9?=-meeting' -> 'Café -meeting').
+
+    Best-effort: decoding is never allowed to raise. A malformed
+    encoded-word (email.errors.HeaderParseError / CharsetError, which are
+    not UnicodeError subclasses, or anything else) falls back to the raw
+    value, still normalised, so the caller compares text rather than
+    failing an operation that already succeeded.
+    """
+    try:
+        parts = []
+        for chunk, charset in decode_header(value):
+            if isinstance(chunk, bytes):
+                chunk = chunk.decode(charset or "ascii", errors="replace")
+            parts.append(chunk)
+        decoded = "".join(parts)
+    except Exception:
+        decoded = value
+    return normalize_header_text(decoded)
 
 
 def decode_body(payload: dict) -> str:
