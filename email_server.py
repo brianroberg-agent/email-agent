@@ -9,6 +9,7 @@ All Gmail API operations go through a proxy server that handles
 Google OAuth authentication and human-in-the-loop controls.
 """
 
+import asyncio
 import base64
 import binascii
 import email
@@ -848,6 +849,12 @@ def draft_content_warnings(current, raw_message: str) -> list[str]:
     return warnings
 
 
+# Cap on the post-update read-back. The proxy client's own timeout is 30 s;
+# a proxy that hangs AFTER the write must not add that long to an update
+# that has already landed. Hitting the cap is a "could not verify" warning.
+DRAFT_READBACK_TIMEOUT = 10.0
+
+
 class DraftReadBack(NamedTuple):
     """Outcome of the post-update read-back: the content warnings it
     produced (possibly a single "could not verify"), and whether the draft
@@ -868,11 +875,22 @@ async def verify_updated_draft(client, draft_id: str, raw_message: str) -> Draft
     "could not verify" warning on a successful response, because the
     update itself landed and reporting failure would invite a retry that
     duplicates it. A 404 is additionally flagged as not_found so the
-    caller can connect it with an unconfirmed id.
+    caller can connect it with an unconfirmed id. The read is capped at
+    DRAFT_READBACK_TIMEOUT seconds (the proxy client's own 30 s timeout
+    would otherwise be added to an update that already landed).
     """
     try:
-        current = await client.get_draft(draft_id, format="raw")
+        current = await asyncio.wait_for(
+            client.get_draft(draft_id, format="raw"), timeout=DRAFT_READBACK_TIMEOUT
+        )
         return DraftReadBack(draft_content_warnings(current, raw_message))
+    except asyncio.TimeoutError:
+        return DraftReadBack(
+            [
+                f"could not verify draft content after update: the read-back "
+                f"did not answer within {DRAFT_READBACK_TIMEOUT:g} s"
+            ]
+        )
     except Exception as e:
         return DraftReadBack(
             [f"could not verify draft content after update: {format_proxy_error(e)}"],

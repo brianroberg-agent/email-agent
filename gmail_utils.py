@@ -105,28 +105,27 @@ def parse_address_list(header_value: str) -> list[str]:
     return [formataddr(pair) for pair in getaddresses([header_value]) if pair[0] or pair[1]]
 
 
-def get_header(headers: Optional[list], name: str) -> str:
+def get_header(headers: list, name: str) -> str:
     """Extract a header value from Gmail message headers.
 
-    Tolerates malformed entries -- a non-dict item, a missing 'name' or
-    'value', or a non-string value -- rather than raising: callers use this
-    on data returned by a remote service, and a header list that is merely
-    odd must not fail a request that has already succeeded.
+    Strict on shape: a header list whose entries are not dicts with 'name'
+    and 'value' raises (KeyError/TypeError), so a read endpoint reports the
+    malformed data as an error instead of returning success with a blank
+    subject, sender or Message-ID -- a blank Message-ID handed back as
+    in_reply_to would silently produce an unthreaded reply draft. The
+    post-update draft read-back does not use this function; it parses the
+    stored raw message instead.
 
     Args:
         headers: List of header dicts with 'name' and 'value' keys
         name: Header name to find (case-insensitive)
 
     Returns:
-        Header value (stringified) or empty string if not found
+        Header value or empty string if not found
     """
-    wanted = name.lower()
-    for header in headers or []:
-        if not isinstance(header, dict):
-            continue
-        if str(header.get("name", "")).lower() == wanted:
-            value = header.get("value")
-            return "" if value is None else str(value)
+    for header in headers:
+        if header["name"].lower() == name.lower():
+            return header["value"]
     return ""
 
 

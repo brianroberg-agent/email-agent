@@ -2244,6 +2244,62 @@ class TestProxyClient:
         assert headers["Content-Type"] == "application/json"
 
 
+class TestMalformedHeaderShapesFailLoud:
+    """Review finding 9: get_header leniency added for the update read-back
+    leaked into /search, GET /drafts and GET /drafts/{id}, which had
+    surfaced a malformed header shape as success=false and started
+    returning success=true with a blank subject / from_addr /
+    rfc822_message_id -- a blank rfc822_message_id fed back as in_reply_to
+    yields an unthreaded draft. Read endpoints report the malformed data
+    as an error; the read-back path no longer uses get_header at all."""
+
+    MALFORMED = [
+        [None],
+        ["not a dict"],
+        [{"value": "Subject with no name"}],
+        [{"name": "Subject"}],
+    ]
+
+    @pytest.mark.parametrize("headers", MALFORMED)
+    @patch("email_server.get_gmail_client")
+    def test_search_with_malformed_header_shape_fails_loud(self, mock_get_client, client, headers):
+        mock_proxy = AsyncMock()
+        mock_get_client.return_value = mock_proxy
+        mock_proxy.list_messages.return_value = {"messages": [{"id": "msg123", "threadId": "t1"}]}
+        mock_proxy.get_message.return_value = {
+            "id": "msg123", "threadId": "t1", "snippet": "", "labelIds": [],
+            "payload": {"headers": headers, "body": {"data": ""}},
+        }
+
+        data = client.post("/search", json={"limit": 1}).json()
+
+        assert data["success"] is False, data
+        assert data["messages"] == []
+        assert data["error"]
+
+    @pytest.mark.parametrize("headers", MALFORMED)
+    @patch("email_server.get_gmail_client")
+    def test_get_draft_with_malformed_header_shape_fails_loud(self, mock_get_client, client, headers):
+        mock_proxy = AsyncMock()
+        mock_get_client.return_value = mock_proxy
+        mock_proxy.get_draft.return_value = {
+            "id": "r123",
+            "message": {"id": "m1", "threadId": "t1", "payload": {"headers": headers, "body": {"data": ""}}},
+        }
+
+        data = client.get("/drafts/r123").json()
+
+        assert data["success"] is False, data
+        assert data["error"]
+
+    @pytest.mark.parametrize("headers", MALFORMED)
+    def test_get_header_is_strict_again(self, headers):
+        from gmail_utils import get_header
+
+        with pytest.raises((KeyError, TypeError)):
+            get_header(headers, "Subject")
+
+
 class TestProxyErrorHandling:
     """Tests for proxy error handling."""
 

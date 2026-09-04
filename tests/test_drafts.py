@@ -6,6 +6,7 @@ from unittest.mock import patch, AsyncMock, call
 
 import pytest
 
+import email_server
 from email_server import DraftRequest, build_draft_message, draft_content_warnings, draft_result_id
 from proxy_client import ProxyError
 from tests.conftest import SAMPLE_MESSAGES
@@ -2143,6 +2144,48 @@ class TestUpdateDraftEndpoint:
         assert len(data["warnings"]) == 1, data
         assert data["warnings"][0].startswith("could not verify draft content after update")
         assert "no longer resolves" not in data["warnings"][0]
+
+
+    # -- review round 1 (finding 10): the read-back is capped -------------
+
+    @patch("email_server.get_gmail_client")
+    def test_update_draft_hanging_read_back_is_capped_and_reported_as_unverified(
+        self, mock_get_client, client, monkeypatch
+    ):
+        """Finding 10: the unconditional read-back inherited the proxy
+        client's 30 s timeout, so a proxy hang AFTER the write added up to
+        30 s to an update that had already landed. The read-back is capped
+        (DRAFT_READBACK_TIMEOUT); hitting the cap is a "could not verify"
+        warning on a successful response, like any other failed read."""
+        import asyncio
+        import time
+
+        monkeypatch.setattr(email_server, "DRAFT_READBACK_TIMEOUT", 0.05)
+        mock_proxy = AsyncMock()
+        mock_get_client.return_value = mock_proxy
+
+        async def get_draft(draft_id, format="full"):
+            if format == "raw":
+                await asyncio.sleep(2)
+            return _draft_resource()
+
+        mock_proxy.get_draft.side_effect = get_draft
+        mock_proxy.update_draft.return_value = _draft_resource()
+
+        started = time.monotonic()
+        data = client.post("/drafts/r123/update", json=UPDATE_BODY).json()
+        elapsed = time.monotonic() - started
+
+        assert elapsed < 1.5, f"read-back was not capped ({elapsed:.2f}s)"
+        assert data["success"] is True, data
+        assert data["draft_id"] == "r123"
+        assert len(data["warnings"]) == 1, data
+        assert data["warnings"][0].startswith("could not verify draft content after update")
+        assert "did not answer within" in data["warnings"][0]
+
+    def test_read_back_timeout_default_is_a_fraction_of_the_proxy_timeout(self):
+        """10 s: long enough for a slow proxy, well under the client's 30 s."""
+        assert email_server.DRAFT_READBACK_TIMEOUT == 10.0
 
 
 class TestDraftResultId:
