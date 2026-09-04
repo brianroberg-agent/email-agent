@@ -288,6 +288,7 @@ class BulkOperation(str, Enum):
     """Supported bulk operations."""
     mark_read = "mark_read"
     archive = "archive"
+    trash = "trash"  # one approval-gated proxy call per message (see /trash)
     # apply_label:LABEL_NAME is handled separately
 
 
@@ -851,7 +852,8 @@ async def apply_single_operation(client, email_id: str, operation: str) -> tuple
     Args:
         client: GmailProxyClient instance
         email_id: The email ID to operate on
-        operation: One of 'mark_read', 'archive', or 'apply_label:LABEL_NAME'
+        operation: One of 'mark_read', 'archive', 'trash', or
+            'apply_label:LABEL_NAME'
 
     Returns:
         Tuple of (success, error_message). error_message is empty on success.
@@ -861,6 +863,13 @@ async def apply_single_operation(client, email_id: str, operation: str) -> tuple
             await client.modify_message(email_id, remove_label_ids=["UNREAD"])
         elif operation == "archive":
             await client.modify_message(email_id, remove_label_ids=["INBOX"])
+        elif operation == "trash":
+            # Same gated proxy route as POST /trash — the proxy has no batch
+            # approval, so a bulk trash is one operator decision per message
+            # (each waiting up to APPROVAL_GATE_TIMEOUT). A decline lands in
+            # this message's error as "Operation blocked: ..." and the
+            # remaining messages are still attempted.
+            await client.trash_message(email_id)
         elif operation.startswith("apply_label:"):
             label_name = operation.split(":", 1)[1]
             if not label_name:
@@ -1186,7 +1195,9 @@ async def bulk_actions(request: BulkActionsRequest):
     Supported operations:
     - mark_read: Remove UNREAD label
     - archive: Remove INBOX label
-    - apply_label:LABEL_NAME: Add the specified label
+    - trash: Move to Trash via the proxy's approval-gated trash route (one
+      approval per message; see POST /trash)
+    - apply_label:LABEL_NAME: Add the specified label (TRASH/SPAM rejected)
     """
     try:
         client = get_gmail_client()

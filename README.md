@@ -381,7 +381,8 @@ Request body:
 Supported operations:
 - `mark_read` - Remove UNREAD label
 - `archive` - Remove INBOX label
-- `apply_label:LABEL_NAME` - Add the specified label (e.g., `apply_label:IMPORTANT`)
+- `trash` - Move the email to Trash through the proxy's approval-gated trash route (the same path as `POST /trash`). The proxy has no batch approval, so a bulk trash is **one operator approval per message**, decided in sequence; the request returns only after every message has been decided, and each `trash` waits up to 330 s for its decision (see `POST /trash`). A declined message gets `"trash: Operation blocked: Request rejected by operator"` in its `error` and the remaining messages are still attempted. Applying `TRASH` as a label is not an alternative — see below.
+- `apply_label:LABEL_NAME` - Add the specified label (e.g., `apply_label:IMPORTANT`); `TRASH`/`SPAM` are rejected (see `POST /apply-label`)
 
 Response:
 ```json
