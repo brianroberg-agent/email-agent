@@ -40,6 +40,7 @@ from proxy_client import (
     ProxyAuthError,
     ProxyForbiddenError,
     ProxyError,
+    ProxyNotFoundError,
 )
 
 # LLM configuration
@@ -638,17 +639,18 @@ def draft_message_thread_id(resource) -> Optional[str]:
 
 
 def draft_result_id(result) -> Optional[str]:
-    """The draft id a proxy create/update result carries, as a string, or
-    None when the result has no usable id (including a non-dict result).
+    """The draft id a proxy create/update result carries, as text, or None
+    when the result has no usable id (including a non-dict result).
 
-    Stringified so an id the proxy happens to return as a non-string
-    neither fails response validation nor reads as a spurious reissue when
-    compared with the str path parameter.
+    An int is accepted and stringified so an id the proxy happens to
+    return as a number neither fails response validation nor reads as a
+    spurious reissue when compared with the str path parameter. Anything
+    that is not a non-blank string or an int is NOT stringified into a
+    confident-looking id (see id_text): False, 1.5 or {} as an "id" means
+    the result carries no id, and the caller's "assuming the requested id
+    is still current" branch is the truthful one.
     """
-    raw = (result if isinstance(result, dict) else {}).get("id")
-    if raw is None or raw == "":
-        return None
-    return str(raw)
+    return id_text((result if isinstance(result, dict) else {}).get("id"))
 
 
 async def resolve_draft_thread(
@@ -846,7 +848,16 @@ def draft_content_warnings(current, raw_message: str) -> list[str]:
     return warnings
 
 
-async def verify_updated_draft(client, draft_id: str, raw_message: str) -> list[str]:
+class DraftReadBack(NamedTuple):
+    """Outcome of the post-update read-back: the content warnings it
+    produced (possibly a single "could not verify"), and whether the draft
+    id it was asked to read no longer resolves (the proxy said 404)."""
+
+    warnings: list[str]
+    not_found: bool = False
+
+
+async def verify_updated_draft(client, draft_id: str, raw_message: str) -> DraftReadBack:
     """Read a draft back after an update and compare it with what was sent.
 
     Gmail's drafts.update response (which the proxy forwards verbatim)
@@ -856,13 +867,17 @@ async def verify_updated_draft(client, draft_id: str, raw_message: str) -> list[
     failed read, an undecodable stored message or any other surprise is a
     "could not verify" warning on a successful response, because the
     update itself landed and reporting failure would invite a retry that
-    duplicates it.
+    duplicates it. A 404 is additionally flagged as not_found so the
+    caller can connect it with an unconfirmed id.
     """
     try:
         current = await client.get_draft(draft_id, format="raw")
-        return draft_content_warnings(current, raw_message)
+        return DraftReadBack(draft_content_warnings(current, raw_message))
     except Exception as e:
-        return [f"could not verify draft content after update: {format_proxy_error(e)}"]
+        return DraftReadBack(
+            [f"could not verify draft content after update: {format_proxy_error(e)}"],
+            not_found=isinstance(e, ProxyNotFoundError),
+        )
 
 
 def draft_success_response(
@@ -1508,22 +1523,36 @@ async def finish_draft_update(
         returned_id = draft_result_id(result)
         id_changed = returned_id is not None and returned_id != draft_id
         effective_draft_id = returned_id or draft_id
-        if returned_id is None:
-            warnings.append(
-                f"proxy returned no draft id; assuming requested id "
-                f"{draft_id} is still current"
-            )
-        elif id_changed:
-            warnings.append(
-                f"proxy returned draft id {returned_id} instead of requested "
-                f"{draft_id} — Gmail's drafts.update may have reissued the "
-                f"id; use {returned_id} for future calls"
-            )
 
         # Cross-check content by reading the draft back: the PUT result
         # never carries the stored message, so this is the only check that
         # can catch a gutted draft (issue #3 Case 2).
-        warnings.extend(await verify_updated_draft(client, effective_draft_id, raw_message))
+        read_back = await verify_updated_draft(client, effective_draft_id, raw_message)
+
+        if returned_id is None and read_back.not_found:
+            # Two facts that mean one thing: the result named no id, and the
+            # id we hold no longer exists. Say that once, and claim nothing
+            # about the draft's thread either.
+            warnings.append(
+                f"the requested draft id {draft_id} no longer resolves (the "
+                f"post-update read-back returned not found) and the proxy "
+                f"returned no draft id — Gmail's drafts.update may have "
+                f"reissued it; list drafts to find the current id"
+            )
+            thread_id = None
+        else:
+            if returned_id is None:
+                warnings.append(
+                    f"proxy returned no draft id; assuming requested id "
+                    f"{draft_id} is still current"
+                )
+            elif id_changed:
+                warnings.append(
+                    f"proxy returned draft id {returned_id} instead of requested "
+                    f"{draft_id} — Gmail's drafts.update may have reissued the "
+                    f"id; use {returned_id} for future calls"
+                )
+            warnings.extend(read_back.warnings)
 
         return draft_success_response(
             result, effective_draft_id, thread_id, warnings, "updated", id_changed=id_changed

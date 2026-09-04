@@ -2247,6 +2247,35 @@ class TestProxyClient:
 class TestProxyErrorHandling:
     """Tests for proxy error handling."""
 
+    def test_404_raises_proxy_not_found_error_which_is_a_proxy_error(self):
+        """Review finding 6: the update read-back needs to tell a draft
+        that no longer exists apart from any other failure. A 404 raises
+        ProxyNotFoundError, a ProxyError subclass so every existing
+        `except ProxyError` still applies."""
+        import httpx
+        from proxy_client import GmailProxyClient, ProxyError, ProxyNotFoundError
+
+        assert issubclass(ProxyNotFoundError, ProxyError)
+        response = httpx.Response(
+            404,
+            json={"error": "not_found", "message": "Draft not found"},
+            request=httpx.Request("GET", "http://proxy/gmail/v1/users/me/drafts/r123"),
+        )
+
+        with pytest.raises(ProxyNotFoundError, match="Draft not found"):
+            GmailProxyClient(api_key="aproxy_test123")._handle_response(response)
+
+    def test_other_4xx_still_raises_plain_proxy_error(self):
+        import httpx
+        from proxy_client import GmailProxyClient, ProxyError, ProxyNotFoundError
+
+        response = httpx.Response(
+            400, json={"message": "bad"}, request=httpx.Request("GET", "http://proxy/x")
+        )
+        with pytest.raises(ProxyError) as excinfo:
+            GmailProxyClient(api_key="aproxy_test123")._handle_response(response)
+        assert not isinstance(excinfo.value, ProxyNotFoundError)
+
     @patch("email_server.get_gmail_client")
     def test_proxy_auth_error_formatted(self, mock_get_client, client):
         """Test that ProxyAuthError is formatted correctly."""

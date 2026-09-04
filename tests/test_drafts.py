@@ -6,7 +6,7 @@ from unittest.mock import patch, AsyncMock, call
 
 import pytest
 
-from email_server import DraftRequest, build_draft_message, draft_content_warnings
+from email_server import DraftRequest, build_draft_message, draft_content_warnings, draft_result_id
 from proxy_client import ProxyError
 from tests.conftest import SAMPLE_MESSAGES
 
@@ -2064,6 +2064,103 @@ class TestUpdateDraftEndpoint:
         data = client.post("/drafts/r123/update", json=UPDATE_BODY).json()
 
         assert data["warnings"] == [], data
+
+    # -- review round 1 (findings 5, 6): what counts as an id, and a dead
+    #    id after the write -----------------------------------------------
+
+    @pytest.mark.parametrize("bogus", [False, True, {"a": 1}, [], "  ", 1.5])
+    @patch("email_server.get_gmail_client")
+    def test_update_draft_non_id_values_in_put_result_are_not_a_reissue(
+        self, mock_get_client, client, bogus
+    ):
+        """Finding 5: draft_result_id stringified ANY non-None, non-'' id,
+        so {"id": False} became a confidently "reissued" id 'False', the
+        read-back went against it, and the caller was told to use it. Only
+        a non-blank string or an int is an id; anything else is no id."""
+        mock_proxy = _update_proxy(mock_get_client, put={"id": bogus, "message": {"id": "msg456"}})
+
+        data = client.post("/drafts/r123/update", json=UPDATE_BODY).json()
+
+        assert data["success"] is True, data
+        assert data["draft_id"] == "r123"
+        assert data["id_changed"] is False
+        assert not any("reissued" in w for w in data["warnings"]), data
+        assert any("no draft id" in w for w in data["warnings"]), data
+        assert mock_proxy.get_draft.call_args_list[-1] == call("r123", format="raw")
+
+    @patch("email_server.get_gmail_client")
+    def test_update_draft_padded_string_id_is_stripped(self, mock_get_client, client):
+        _update_proxy(mock_get_client, put={"id": " r123 ", "message": {"id": "msg456"}})
+
+        data = client.post("/drafts/r123/update", json=UPDATE_BODY).json()
+
+        assert data["draft_id"] == "r123"
+        assert data["id_changed"] is False
+        assert not any("no draft id" in w for w in data["warnings"]), data
+
+    @patch("email_server.get_gmail_client")
+    def test_update_draft_no_id_and_read_back_not_found_says_the_id_is_dead(self, mock_get_client, client):
+        """Finding 6: a PUT result with no id produced "assuming requested
+        id r123 is still current", then the read-back 404'd and produced a
+        second, unconnected "could not verify" warning -- and the caller
+        kept a dead id. The two facts together mean one thing: the id no
+        longer resolves and was probably reissued. Say that, once, and
+        claim nothing about the draft's thread."""
+        from proxy_client import ProxyNotFoundError
+
+        _update_proxy(
+            mock_get_client,
+            put={"message": {"id": "msg456", "threadId": "t_keep"}},
+            post=ProxyNotFoundError("Draft not found"),
+        )
+
+        data = client.post("/drafts/r123/update", json=UPDATE_BODY).json()
+
+        assert data["success"] is True, data
+        assert data["draft_id"] == "r123"
+        assert data["id_changed"] is False
+        assert data["thread_attached"] is False
+        assert len(data["warnings"]) == 1, data
+        assert "no longer resolves" in data["warnings"][0]
+        assert "list drafts" in data["warnings"][0]
+        assert "assuming" not in data["warnings"][0]
+        assert "no longer resolves" in data["message"]
+
+    @patch("email_server.get_gmail_client")
+    def test_update_draft_confirmed_id_and_read_back_not_found_is_just_unverified(
+        self, mock_get_client, client
+    ):
+        """When the PUT result did confirm the id, a 404 on the read-back
+        is an ordinary failed verification, not a reissue diagnosis."""
+        from proxy_client import ProxyNotFoundError
+
+        _update_proxy(mock_get_client, post=ProxyNotFoundError("Draft not found"))
+
+        data = client.post("/drafts/r123/update", json=UPDATE_BODY).json()
+
+        assert data["success"] is True, data
+        assert data["thread_attached"] is True
+        assert len(data["warnings"]) == 1, data
+        assert data["warnings"][0].startswith("could not verify draft content after update")
+        assert "no longer resolves" not in data["warnings"][0]
+
+
+class TestDraftResultId:
+    """draft_result_id / id_text: what the server accepts as a Gmail id."""
+
+    @pytest.mark.parametrize("value,expected", [
+        ("r123", "r123"), (" r123 ", "r123"), (123, "123"), (0, "0"),
+    ])
+    def test_strings_and_ints_are_ids(self, value, expected):
+        assert draft_result_id({"id": value}) == expected
+
+    @pytest.mark.parametrize("value", [None, "", "   ", False, True, 1.5, {"a": 1}, [], ["r123"]])
+    def test_anything_else_is_no_id(self, value):
+        assert draft_result_id({"id": value}) is None
+
+    @pytest.mark.parametrize("result", [None, [], "r123", 5])
+    def test_non_dict_result_is_no_id(self, result):
+        assert draft_result_id(result) is None
 
 
 # =============================================================================
