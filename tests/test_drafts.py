@@ -1839,6 +1839,67 @@ class TestUpdateDraftEndpoint:
         assert data["id_changed"] is False
         assert data["message"] == "Draft updated: r123"
 
+    # -- review round 1 (finding 1): post-write work can never fail a
+    #    landed update ------------------------------------------------------
+
+    @patch("email_server.get_gmail_client")
+    def test_update_draft_int_thread_id_in_put_result_does_not_fail_update(self, mock_get_client, client):
+        """Finding 1: a non-string threadId in the PUT result reached
+        DraftResponse.thread_id (Optional[str]); pydantic 2 does not coerce
+        int->str, the ValidationError is a ValueError, and update_draft's
+        `except ValueError` turned an update Gmail had applied into
+        success=False."""
+        _update_proxy(
+            mock_get_client,
+            put={"id": "r123", "message": {"id": "msg456", "threadId": 123}},
+        )
+
+        data = client.post("/drafts/r123/update", json=UPDATE_BODY).json()
+
+        assert data["success"] is True, data
+        assert data["error"] is None
+        assert data["thread_id"] == "123"
+
+    @patch("email_server.get_gmail_client")
+    def test_update_draft_int_thread_id_in_pre_read_is_not_a_thread_contradiction(self, mock_get_client, client):
+        """Finding 1 (companion): the pre-update read carried threadId 123
+        (int); it was re-sent as thread_id=123, the PUT echoed "123", and
+        `actual != thread_id` was True -> a spurious "landed in thread 123
+        instead of requested 123" warning and thread_attached=False."""
+        mock_proxy = _update_proxy(
+            mock_get_client,
+            pre={"id": "r123", "message": {"id": "msg456", "threadId": 123}},
+            put={"id": "r123", "message": {"id": "msg456", "threadId": "123"}},
+        )
+
+        data = client.post("/drafts/r123/update", json=UPDATE_BODY).json()
+
+        assert data["success"] is True, data
+        assert mock_proxy.update_draft.call_args.kwargs["thread_id"] == "123"
+        assert data["thread_id"] == "123"
+        assert data["thread_attached"] is True
+        assert not any("instead of requested" in w for w in data["warnings"])
+
+    @patch("email_server.draft_content_warnings", side_effect=RuntimeError("boom"))
+    @patch("email_server.get_gmail_client")
+    def test_update_draft_unexpected_post_write_exception_is_a_warning_not_a_failure(
+        self, mock_get_client, _mock_check, client
+    ):
+        """Finding 1 (structural): the post-write checks used to run inside
+        the same try whose except clauses map exceptions to success=False.
+        Whatever a post-write check does -- even raise something nobody
+        anticipated -- the caller must still be told the update landed, so
+        it is not retried and duplicated."""
+        _update_proxy(mock_get_client)
+
+        data = client.post("/drafts/r123/update", json=UPDATE_BODY).json()
+
+        assert data["success"] is True, data
+        assert data["error"] is None
+        assert data["draft_id"] == "r123"
+        assert any("boom" in w for w in data["warnings"])
+        assert "boom" in data["message"]
+
 
 # =============================================================================
 # HEADER DECODING / get_header HARDENING (FINDINGS #11-1, #11-2, #11-8, #11-10)

@@ -605,9 +605,32 @@ def draft_message(resource) -> dict:
     return message if isinstance(message, dict) else {}
 
 
+def id_text(raw) -> Optional[str]:
+    """A Gmail identifier (draft id, thread id) as text, or None when the
+    value is not a usable id.
+
+    Accepts a non-blank string (stripped) or an int, which a proxy may
+    hand back for an id Gmail returns as a string. Anything else -- None,
+    '', whitespace, a bool (an int subclass), a float, a list or dict --
+    is no id at all rather than something to stringify into a confident
+    but meaningless identifier.
+    """
+    if isinstance(raw, bool):
+        return None
+    if isinstance(raw, int):
+        return str(raw)
+    if isinstance(raw, str) and raw.strip():
+        return raw.strip()
+    return None
+
+
 def draft_message_thread_id(resource) -> Optional[str]:
-    """The threadId of a draft resource's embedded message, if any."""
-    return draft_message(resource).get("threadId") or None
+    """The threadId of a draft resource's embedded message, as text, if
+    any. Stringified (see id_text) so an int threadId neither fails
+    DraftResponse validation after a write nor reads as a contradiction
+    of the same id echoed back as a string.
+    """
+    return id_text(draft_message(resource).get("threadId"))
 
 
 def draft_result_id(result) -> Optional[str]:
@@ -1361,6 +1384,11 @@ async def update_draft(draft_id: str, request: DraftRequest):
 
     Replaces the draft's message with a new RFC 2822 message built
     from the provided structured fields.
+
+    Structure matters here: only the work up to and including the write
+    sits inside the try whose except clauses map exceptions to
+    success=False. Once Gmail has applied the write, control leaves that
+    try for good -- see finish_draft_update.
     """
     try:
         raw_message = build_draft_message(request)
@@ -1372,10 +1400,32 @@ async def update_draft(draft_id: str, request: DraftRequest):
 
         result = await client.update_draft(draft_id, raw_message, thread_id=thread_id)
 
-        # Everything below runs after Gmail applied the write. Nothing here
-        # may turn the response into a failure: a caller told "failed"
-        # about an update that landed retries it and duplicates the work.
+    except ValueError as e:
+        return DraftResponse(success=False, message="", error=str(e))
+    except Exception as e:
+        return DraftResponse(success=False, message="", error=format_proxy_error(e))
 
+    return await finish_draft_update(client, result, draft_id, thread_id, warnings, request)
+
+
+async def finish_draft_update(
+    client,
+    result,
+    draft_id: str,
+    thread_id: Optional[str],
+    warnings: list[str],
+    request: DraftRequest,
+) -> DraftResponse:
+    """Everything that happens after Gmail applied a draft update.
+
+    Nothing here may turn the response into a failure: a caller told
+    "failed" about an update that landed retries it and duplicates the
+    work. Each check reports its own problems as warnings, and this
+    function's own guard catches anything a check did not anticipate and
+    reports THAT as a warning on a minimal success response built only
+    from values known to be valid.
+    """
+    try:
         # Cross-check identity: issue #3's leading suspicion for a stale-id
         # failure was drafts.update reissuing a new id. Never trust the
         # requested path id as the current one without checking the result.
@@ -1402,11 +1452,18 @@ async def update_draft(draft_id: str, request: DraftRequest):
         return draft_success_response(
             result, effective_draft_id, thread_id, warnings, "updated", id_changed=id_changed
         )
-
-    except ValueError as e:
-        return DraftResponse(success=False, message="", error=str(e))
     except Exception as e:
-        return DraftResponse(success=False, message="", error=format_proxy_error(e))
+        note = f"post-update checks failed unexpectedly: {format_proxy_error(e)}"
+        safe_warnings = [str(w) for w in warnings] + [note]
+        notes = "".join(f" (warning: {w})" for w in safe_warnings)
+        return DraftResponse(
+            success=True,
+            draft_id=str(draft_id),
+            thread_id=str(thread_id) if thread_id is not None else None,
+            thread_attached=False,
+            message=f"Draft updated: {draft_id}{notes}",
+            warnings=safe_warnings,
+        )
 
 
 @app.delete("/drafts/{draft_id}", response_model=ActionResponse)
