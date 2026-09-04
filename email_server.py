@@ -94,6 +94,14 @@ async def lifespan(_app: FastAPI):
         file=sys.stderr,
         flush=True,
     )
+    if LLM_BACKEND_NAME == "the model server":
+        print(
+            "email-agent: WARN LLM_BACKEND_NAME is unset -- LLM diagnostics "
+            "will say 'the model server' instead of naming the actual "
+            "backend; set LLM_BACKEND_NAME to what is actually deployed",
+            file=sys.stderr,
+            flush=True,
+        )
     yield
 
 

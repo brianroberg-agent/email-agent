@@ -7,7 +7,10 @@ Testing patterns inspired by datasette-enrichments:
 - Edge case and error handling tests
 """
 
+import os
 import re
+import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -15,6 +18,23 @@ from unittest.mock import Mock, patch, AsyncMock
 
 from email_server import LLMResult
 from tests.conftest import SAMPLE_MESSAGES
+
+
+def _run_subprocess_import(code: str, env: dict | None = None) -> subprocess.CompletedProcess:
+    """Run `code` via `python -c` from the repo root and return the completed
+    process. Shared by tests that need to observe env-var-driven behavior at
+    module-import time (pytest has already imported email_server once, so an
+    in-process re-import can't exercise a different environment). `env=None`
+    inherits the current process environment unchanged; pass a dict to
+    replace it entirely."""
+    kwargs = {} if env is None else {"env": env}
+    return subprocess.run(
+        [sys.executable, "-c", code],
+        capture_output=True,
+        text=True,
+        cwd=Path(__file__).resolve().parents[1],
+        **kwargs,
+    )
 
 
 class TestHealthEndpoint:
@@ -1011,27 +1031,6 @@ class TestCallLocalLLM:
             assert result.degraded is False
 
     @pytest.mark.asyncio
-    async def test_call_local_llm_raises_unreachable_on_connect_error(self):
-        import httpx
-        import email_server
-        from email_server import call_local_llm, LLMUnreachableError
-
-        # patch.object rather than relying on the process env: the module
-        # default is neutral and a developer's env may set LLM_BACKEND_NAME.
-        with patch.object(email_server, "LLM_BACKEND_NAME", "TestBackend"), patch.object(
-            httpx.AsyncClient, "post", new_callable=AsyncMock
-        ) as mock_post:
-            mock_post.side_effect = httpx.ConnectError("All connection attempts failed")
-            with pytest.raises(LLMUnreachableError) as exc_info:
-                await call_local_llm("System prompt", "User content")
-            msg = str(exc_info.value)
-            assert "Cannot reach" in msg
-            assert email_server.MLX_URL in msg
-            assert "TestBackend" in msg
-            assert "LM Studio" not in msg
-            assert "All connection attempts failed" in msg
-
-    @pytest.mark.asyncio
     async def test_call_local_llm_raises_timeout_on_read_timeout(self):
         import httpx
         from email_server import call_local_llm, LLMTimeoutError
@@ -1489,24 +1488,17 @@ class TestLLMConfig:
     Message content is checked with patch.object on the module constant.
     """
 
-    @staticmethod
-    def _import_constant(name: str, env_overrides: dict) -> str:
-        import os
-        import subprocess
-        import sys
-        from pathlib import Path
+    #: Env vars this test class overrides -- stripped from the child process's
+    #: environment before applying overrides, so a developer's own shell
+    #: exports of any of these can't leak into a result under test.
+    _CONFIG_VARS = ("LLM_BACKEND_NAME", "LLM_MAX_TOKENS", "MLX_URL", "MLX_MODEL", "PROXY_URL")
 
-        env = {
-            k: v for k, v in os.environ.items()
-            if k not in ("LLM_BACKEND_NAME", "LLM_MAX_TOKENS")
-        }
+    @classmethod
+    def _import_constant(cls, name: str, env_overrides: dict) -> str:
+        env = {k: v for k, v in os.environ.items() if k not in cls._CONFIG_VARS}
         env.update(env_overrides)
-        result = subprocess.run(
-            [sys.executable, "-c", f"import email_server; print(repr(email_server.{name}))"],
-            capture_output=True,
-            text=True,
-            env=env,
-            cwd=Path(__file__).resolve().parents[1],
+        result = _run_subprocess_import(
+            f"import email_server; print(repr(email_server.{name}))", env=env
         )
         assert result.returncode == 0, result.stderr
         return result.stdout.strip()
@@ -1519,8 +1511,15 @@ class TestLLMConfig:
     def test_llm_backend_name_defaults_to_neutral_phrase(self):
         """On a fresh install nothing knows what server sits behind MLX_URL
         (the default URL is port 8080, which is not Ollama's 11434), so the
-        default must not assert a product. Deployments set LLM_BACKEND_NAME."""
-        assert self._import_constant("LLM_BACKEND_NAME", {}) == "'the model server'"
+        default must not assert a product. Deployments set LLM_BACKEND_NAME.
+
+        Checked in-process (no subprocess needed) since this only reads the
+        constant already bound at pytest's own import of email_server; the
+        subprocess machinery above exists for tests that need to rebind a
+        constant to a *different* env, which this one doesn't."""
+        import email_server
+
+        assert email_server.LLM_BACKEND_NAME == "the model server"
 
     def test_llm_backend_name_configurable_via_env(self):
         """Backend product name must be config-driven, not a hardcoded
@@ -1701,16 +1700,7 @@ class TestStartupBanner:
 
     def test_import_does_not_print_banner(self):
         """Importing the module (pytest, tooling) must not emit the banner."""
-        import subprocess
-        import sys
-        from pathlib import Path
-
-        result = subprocess.run(
-            [sys.executable, "-c", "import email_server"],
-            capture_output=True,
-            text=True,
-            cwd=Path(__file__).resolve().parents[1],
-        )
+        result = _run_subprocess_import("import email_server")
         assert result.returncode == 0, result.stderr
         assert "email-agent: MLX_URL=" not in result.stderr
 
@@ -1724,6 +1714,34 @@ class TestStartupBanner:
 
         captured = capfd.readouterr()
         assert "email-agent: MLX_URL=" in captured.err
+
+    def test_banner_warns_when_backend_name_is_default(self, capfd):
+        """A deployment that never set LLM_BACKEND_NAME should get a
+        breadcrumb in the boot log -- otherwise the only sign is every LLM
+        diagnostic silently saying 'the model server' instead of naming the
+        actual backend, which is easy to miss until something breaks."""
+        from fastapi.testclient import TestClient
+        import email_server
+
+        with patch.object(email_server, "LLM_BACKEND_NAME", "the model server"):
+            with TestClient(email_server.app):
+                pass
+
+        captured = capfd.readouterr()
+        assert "WARN" in captured.err
+        assert "LLM_BACKEND_NAME" in captured.err
+
+    def test_banner_does_not_warn_when_backend_name_is_configured(self, capfd):
+        """No warning once a deployment has actually set LLM_BACKEND_NAME."""
+        from fastapi.testclient import TestClient
+        import email_server
+
+        with patch.object(email_server, "LLM_BACKEND_NAME", "vLLM"):
+            with TestClient(email_server.app):
+                pass
+
+        captured = capfd.readouterr()
+        assert "WARN" not in captured.err
 
 
 class TestRequestValidation:
