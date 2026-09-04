@@ -11,7 +11,7 @@ Claude Code (cloud, orchestrator)
     ▼
 email_server.py (local FastAPI server, port 8081)
     │                        │
-    │ Proxy API (API key)    │ Local LLM (MLX, port 8080)
+    │ Proxy API (API key)    │ Local LLM (OpenAI-style API at MLX_URL)
     ▼                        ▼
 api-proxy (handles OAuth)   Qwen3-14B (summarize/ask-about only)
     │
@@ -56,7 +56,7 @@ No separate install step needed. The `uv run` command automatically manages depe
 | `MLX_URL` | No | `http://localhost:8080/v1/chat/completions` | Local LLM endpoint |
 | `MLX_MODEL` | No | `qwen/qwen3-14b` | Model name for LLM requests |
 | `LLM_MAX_TOKENS` | No | `4096` | Token budget per LLM completion (reasoning + answer) |
-| `LLM_BACKEND_NAME` | No | `Ollama` | Product name of the server behind `MLX_URL`, used only in diagnostic/error text (e.g. "Check that {name} is running") |
+| `LLM_BACKEND_NAME` | No | `the model server` | Product name of the server behind `MLX_URL`, used only in diagnostic/error text ("Cannot reach {name} at {MLX_URL} ..."). Set it to what is actually deployed (e.g. `Ollama`) so errors name the right thing |
 
 ## Usage
 
