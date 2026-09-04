@@ -7,7 +7,6 @@ They have no framework or authentication dependencies.
 import base64
 import re
 import unicodedata
-from email.header import decode_header
 from email.utils import formataddr, getaddresses
 from typing import Optional
 
@@ -142,37 +141,6 @@ def normalize_header_text(value: str) -> str:
     text = unicodedata.normalize("NFC", str(value))
     text = "".join(ch for ch in text if unicodedata.category(ch) != "Cf")
     return " ".join(text.split())
-
-
-def decode_header_text(value: str) -> str:
-    """Decode an RFC 2047 encoded-word header value to comparable plain
-    text (see normalize_header_text for the normalisation applied).
-
-    A non-ASCII Subject may come back as an encoded-word (e.g.
-    'Café meeting' -> '=?utf-8?q?Caf=C3=A9_meeting?='), not as the literal
-    text that was sent, so a raw string comparison against the request
-    would flag every correct non-ASCII update as a mismatch.
-
-    Chunks are joined directly rather than via email.header.make_header,
-    which inserts a space between an encoded chunk and an adjacent
-    unencoded one ('=?utf-8?q?Caf=C3=A9?=-meeting' -> 'Café -meeting').
-
-    Best-effort: decoding is never allowed to raise. A malformed
-    encoded-word (email.errors.HeaderParseError / CharsetError, which are
-    not UnicodeError subclasses, or anything else) falls back to the raw
-    value, still normalised, so the caller compares text rather than
-    failing an operation that already succeeded.
-    """
-    try:
-        parts = []
-        for chunk, charset in decode_header(value):
-            if isinstance(chunk, bytes):
-                chunk = chunk.decode(charset or "ascii", errors="replace")
-            parts.append(chunk)
-        decoded = "".join(parts)
-    except Exception:
-        decoded = value
-    return normalize_header_text(decoded)
 
 
 def decode_body(payload: dict) -> str:

@@ -9,6 +9,10 @@ All Gmail API operations go through a proxy server that handles
 Google OAuth authentication and human-in-the-loop controls.
 """
 
+import base64
+import binascii
+import email
+import email.policy
 import json
 import os
 import re
@@ -23,7 +27,7 @@ from pydantic import BaseModel, Field
 
 from gmail_utils import (
     get_header,
-    decode_header_text,
+    normalize_header_text,
     decode_body,
     parse_address_list,
     parse_references,
@@ -740,53 +744,125 @@ def build_draft_message(request: "DraftRequest") -> str:
     )
 
 
-def draft_content_warnings(current, request: "DraftRequest") -> list[str]:
-    """Cross-check a draft resource read back after an update against the
-    request. `current` is the GET /drafts/{id}?format=metadata result,
-    whose embedded message carries the stored headers.
+def decode_raw_message(raw: str) -> email.message.EmailMessage:
+    """Parse a base64url RFC 2822 message (Gmail's ``raw`` field, or the
+    one this server built) with the modern email policy, which decodes
+    RFC 2047 encoded-words -- including mixed with plain 8-bit text, the
+    case the old hand-rolled decoder mangled -- and never raises on a
+    malformed one (defects are recorded, not thrown).
 
-    Issue #3's Case 2 was a draft silently gutted to a different subject
-    behind a success-shaped response; a Subject that is blank or missing
-    while other headers are present is exactly that case and warns. A
-    read-back with no headers at all cannot verify anything and says so
-    rather than passing silently.
-
-    The stored Subject is RFC 2047-decoded and both sides normalised (see
-    gmail_utils.decode_header_text) so a correct non-ASCII update is not
-    flagged merely because it came back encoded-word.
-
-    Never raises: this runs after Gmail applied the write, so a surprise
-    in the read-back is reported as a warning, not as a failed update.
+    Gmail's base64url strings may arrive without '=' padding.
     """
+    padded = raw + "=" * (-len(raw) % 4)
+    data = base64.b64decode(padded, altchars=b"-_", validate=True)
+    return email.message_from_bytes(data, policy=email.policy.default)
+
+
+def message_recipients(msg: email.message.EmailMessage, name: str) -> frozenset[str]:
+    """The addr-specs of an address header, lower-cased. Display names and
+    address case are Gmail's to rewrite; the mailbox is what identifies a
+    recipient."""
+    header = msg[name]
+    if header is None:
+        return frozenset()
+    return frozenset(a.addr_spec.lower() for a in header.addresses if a.addr_spec)
+
+
+def message_body_text(msg: email.message.EmailMessage) -> str:
+    """The plain-text body, decoded from whatever transfer encoding Gmail
+    chose, normalised for comparison (line endings and whitespace runs
+    collapsed -- this is a content check, not a byte check)."""
+    body = msg.get_body(preferencelist=("plain",))
+    if body is None:
+        return ""
+    content = body.get_content()
+    return normalize_header_text(content if isinstance(content, str) else "")
+
+
+def draft_content_warnings(current, raw_message: str) -> list[str]:
+    """Cross-check a draft resource read back after an update against the
+    message that was sent. `current` is the GET /drafts/{id}?format=raw
+    result, whose embedded message carries the stored RFC 2822 message
+    base64url-encoded; `raw_message` is the base64url message this server
+    built for the update.
+
+    Both sides are parsed the same way (decode_raw_message) and compared
+    field by field: Subject as decoded, normalised text; To/Cc/Bcc as sets
+    of addr-specs; the plain-text body as normalised text. Issue #3's Case
+    2 was a draft gutted to a null subject, null To and empty body behind a
+    success-shaped response -- a Subject-only check would pass a draft
+    whose body or recipients were gutted. The body is never quoted in a
+    warning; bodies stay on this machine.
+
+    Two distinct outcomes, deliberately not conflated:
+    - the read-back carries no usable stored message (no dict, no ``raw``,
+      a non-string/blank one, or one that is not base64url) -> "could not
+      verify": nothing is known about the draft;
+    - the stored message parses and differs -> "content mismatch": the
+      draft IS wrong.
+    Anything else that goes wrong propagates to the single guard in
+    verify_updated_draft, which reports it as "could not verify" as well.
+    """
+    raw = draft_message(current).get("raw")
+    if not isinstance(raw, str) or not raw.strip():
+        return ["could not verify draft content: the read-back carried no stored message"]
     try:
-        headers = draft_message(current).get("payload", {}).get("headers")
-        if not isinstance(headers, list) or not headers:
-            return ["could not verify draft content: the read-back carried no message headers"]
-        stored_subject = decode_header_text(get_header(headers, "Subject"))
-        if stored_subject == decode_header_text(request.subject):
-            return []
-        return [
-            f"draft content mismatch — requested subject {request.subject!r} "
-            f"but the stored draft's Subject header is now {stored_subject!r}"
-        ]
-    except Exception as e:  # pragma: no cover - belt and braces
-        return [f"could not verify draft content: {format_proxy_error(e)}"]
+        stored = decode_raw_message(raw)
+    except (binascii.Error, ValueError):
+        return ["could not verify draft content: the read-back's stored message is not valid base64url"]
+    sent = decode_raw_message(raw_message)
+    warnings = []
+
+    stored_subject = stored["Subject"]
+    sent_subject = normalize_header_text(str(sent["Subject"] or ""))
+    stored_subject_text = (
+        normalize_header_text(str(stored_subject)) if stored_subject is not None else None
+    )
+    if stored_subject_text != sent_subject:
+        shown = repr(stored_subject_text) if stored_subject_text is not None else "missing"
+        warnings.append(
+            f"draft content mismatch — requested subject {sent_subject!r} "
+            f"but the stored draft's Subject header is now {shown}"
+        )
+
+    for name in ("To", "Cc", "Bcc"):
+        stored_rcpts = message_recipients(stored, name)
+        sent_rcpts = message_recipients(sent, name)
+        if stored_rcpts != sent_rcpts:
+            warnings.append(
+                f"draft content mismatch — requested {name} recipients "
+                f"{sorted(sent_rcpts)} but the stored draft's {name} is now "
+                f"{sorted(stored_rcpts)}"
+            )
+
+    stored_body = message_body_text(stored)
+    sent_body = message_body_text(sent)
+    if stored_body != sent_body:
+        warnings.append(
+            f"draft content mismatch — the stored draft's body differs from "
+            f"the requested body ({len(stored_body)} vs {len(sent_body)} "
+            f"characters after whitespace normalisation)"
+        )
+    return warnings
 
 
-async def verify_updated_draft(client, draft_id: str, request: "DraftRequest") -> list[str]:
-    """Read a draft back after an update and compare it with the request.
+async def verify_updated_draft(client, draft_id: str, raw_message: str) -> list[str]:
+    """Read a draft back after an update and compare it with what was sent.
 
     Gmail's drafts.update response (which the proxy forwards verbatim)
-    carries only ids, never the stored headers, so the only way to know
-    what the draft now says is to read it. Best-effort: a failed read is a
-    warning on a successful response, because the update itself landed
-    and reporting failure would invite a retry that duplicates it.
+    carries only ids, never the stored message, so the only way to know
+    what the draft now says is to read it (format=raw: the whole stored
+    RFC 2822 message in one round-trip). Best-effort, with ONE guard: a
+    failed read, an undecodable stored message or any other surprise is a
+    "could not verify" warning on a successful response, because the
+    update itself landed and reporting failure would invite a retry that
+    duplicates it.
     """
     try:
-        current = await client.get_draft(draft_id, format="metadata")
+        current = await client.get_draft(draft_id, format="raw")
+        return draft_content_warnings(current, raw_message)
     except Exception as e:
         return [f"could not verify draft content after update: {format_proxy_error(e)}"]
-    return draft_content_warnings(current, request)
 
 
 def draft_success_response(
@@ -1405,7 +1481,7 @@ async def update_draft(draft_id: str, request: DraftRequest):
     except Exception as e:
         return DraftResponse(success=False, message="", error=format_proxy_error(e))
 
-    return await finish_draft_update(client, result, draft_id, thread_id, warnings, request)
+    return await finish_draft_update(client, result, draft_id, thread_id, warnings, raw_message)
 
 
 async def finish_draft_update(
@@ -1414,7 +1490,7 @@ async def finish_draft_update(
     draft_id: str,
     thread_id: Optional[str],
     warnings: list[str],
-    request: DraftRequest,
+    raw_message: str,
 ) -> DraftResponse:
     """Everything that happens after Gmail applied a draft update.
 
@@ -1445,9 +1521,9 @@ async def finish_draft_update(
             )
 
         # Cross-check content by reading the draft back: the PUT result
-        # never carries the stored headers, so this is the only check that
+        # never carries the stored message, so this is the only check that
         # can catch a gutted draft (issue #3 Case 2).
-        warnings.extend(await verify_updated_draft(client, effective_draft_id, request))
+        warnings.extend(await verify_updated_draft(client, effective_draft_id, raw_message))
 
         return draft_success_response(
             result, effective_draft_id, thread_id, warnings, "updated", id_changed=id_changed
