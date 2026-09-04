@@ -435,7 +435,6 @@ class TestCreateDraftEndpoint:
     def test_create_draft_survives_thread_lookup_failure(self, mock_get_client, client):
         """Thread resolution is best-effort: a proxy error during the lookup
         must not abort draft creation — the draft is created standalone."""
-        from proxy_client import ProxyError
         mock_proxy = AsyncMock()
         mock_get_client.return_value = mock_proxy
         mock_proxy.list_messages.side_effect = ProxyError("proxy 502")
@@ -699,7 +698,6 @@ class TestCreateDraftEndpoint:
     def test_create_draft_lookup_error_tries_next_candidate(self, mock_get_client, client):
         """A transient failure on one candidate lookup degrades to the next
         candidate, not to a standalone draft."""
-        from proxy_client import ProxyError
         mock_proxy = AsyncMock()
         mock_get_client.return_value = mock_proxy
         mock_proxy.list_messages.side_effect = [
@@ -800,7 +798,6 @@ class TestCreateDraftEndpoint:
     def test_create_draft_retries_standalone_when_attach_rejected(self, mock_get_client, client):
         """Best-effort attach: if Gmail rejects the auto-resolved thread,
         the documented 'draft is still created' promise holds."""
-        from proxy_client import ProxyError
         mock_proxy = AsyncMock()
         mock_get_client.return_value = mock_proxy
         mock_proxy.list_messages.return_value = {
@@ -831,7 +828,6 @@ class TestCreateDraftEndpoint:
     def test_create_draft_no_standalone_retry_for_explicit_thread_id(self, mock_get_client, client):
         """An explicit thread_id expresses intent — a rejected attach is an
         error, not something to silently drop."""
-        from proxy_client import ProxyError
         mock_proxy = AsyncMock()
         mock_get_client.return_value = mock_proxy
         mock_proxy.create_draft.side_effect = ProxyError("threading criteria not met")
@@ -1025,7 +1021,6 @@ class TestCreateDraftEndpoint:
 
     @patch("email_server.get_gmail_client")
     def test_create_draft_proxy_error(self, mock_get_client, client):
-        from proxy_client import ProxyError
         mock_proxy = AsyncMock()
         mock_get_client.return_value = mock_proxy
         mock_proxy.create_draft.side_effect = ProxyError("Backend error")
@@ -1251,7 +1246,6 @@ class TestGetDraftEndpoint:
 
     @patch("email_server.get_gmail_client")
     def test_get_draft_proxy_error(self, mock_get_client, client):
-        from proxy_client import ProxyError
         mock_proxy = AsyncMock()
         mock_get_client.return_value = mock_proxy
         mock_proxy.get_draft.side_effect = ProxyError("Not found")
@@ -1273,27 +1267,15 @@ class TestUpdateDraftEndpoint:
 
     @patch("email_server.get_gmail_client")
     def test_update_draft_success(self, mock_get_client, client):
-        mock_proxy = AsyncMock()
-        mock_get_client.return_value = mock_proxy
-        mock_proxy.get_draft.return_value = {
-            "id": "r123",
-            "message": {"id": "msg456", "threadId": "t_keep"},
-        }
-        mock_proxy.update_draft.return_value = {
-            "id": "r123",
-            "message": {"id": "msg456"},
-        }
+        mock_proxy = _update_proxy(mock_get_client, put={"id": "r123", "message": {"id": "msg456"}})
 
-        response = client.post("/drafts/r123/update", json={
-            "to": ["bob@example.com"],
-            "subject": "Updated subject",
-            "body": "Updated body",
-        })
+        response = client.post("/drafts/r123/update", json=UPDATE_BODY)
 
         assert response.status_code == 200
         data = response.json()
         assert data["success"] is True
         assert data["draft_id"] == "r123"
+        assert data["warnings"] == []
 
         mock_proxy.update_draft.assert_called_once()
         call_args = mock_proxy.update_draft.call_args
@@ -1309,18 +1291,13 @@ class TestUpdateDraftEndpoint:
         the response still looked like a success. If that ever recurs, the
         caller must be told the id changed and given the new one to use --
         not silently handed back the stale id it asked for."""
-        mock_proxy = AsyncMock()
-        mock_get_client.return_value = mock_proxy
-        mock_proxy.update_draft.return_value = {
-            "id": "r999-new",
-            "message": {"id": "msg456", "threadId": "t_keep"},
-        }
+        _update_proxy(
+            mock_get_client,
+            put=_draft_resource(draft_id="r999-new"),
+            post=_draft_resource(draft_id="r999-new", subject="Updated subject"),
+        )
 
-        response = client.post("/drafts/r123/update", json={
-            "to": ["bob@example.com"],
-            "subject": "Updated subject",
-            "body": "Updated body",
-        })
+        response = client.post("/drafts/r123/update", json=UPDATE_BODY)
 
         assert response.status_code == 200
         data = response.json()
@@ -1329,41 +1306,8 @@ class TestUpdateDraftEndpoint:
         assert "r999-new" in data["message"]
         assert "r123" in data["message"]
         assert "warning" in data["message"]
+        assert len(data["warnings"]) == 1  # the reissue, and nothing else
 
-    @patch("email_server.get_gmail_client")
-    def test_update_draft_id_match_no_warning(self, mock_get_client, client):
-        """The common case -- proxy echoes back the same draft id -- must
-        not be flagged as a mismatch."""
-        _update_proxy(mock_get_client)
-
-        data = client.post("/drafts/r123/update", json=UPDATE_BODY).json()
-
-        assert data["draft_id"] == "r123"
-        assert "warning" not in data["message"]
-    @patch("email_server.get_gmail_client")
-    def test_update_draft_content_mismatch_subject_warns(self, mock_get_client, client):
-        """Issue #3's Case 2 was a draft gutted to a different subject/body
-        behind a success response. The draft is read back after the write
-        (format=metadata) and its Subject cross-checked against what was
-        sent."""
-        _update_proxy(mock_get_client, post=_draft_resource(subject="Something else entirely"))
-
-        data = client.post("/drafts/r123/update", json=UPDATE_BODY).json()
-
-        assert data["success"] is True
-        assert "warning" in data["message"]
-        assert "Updated subject" in data["message"]
-        assert "Something else entirely" in data["message"]
-    @patch("email_server.get_gmail_client")
-    def test_update_draft_content_match_subject_no_warning(self, mock_get_client, client):
-        """A read-back whose Subject header matches the request must not be
-        flagged."""
-        _update_proxy(mock_get_client, post=_draft_resource(subject="Updated subject"))
-
-        data = client.post("/drafts/r123/update", json=UPDATE_BODY).json()
-
-        assert data["success"] is True
-        assert "warning" not in data["message"]
     @patch("email_server.get_gmail_client")
     def test_update_draft_sparse_put_result_is_fine_when_read_back_matches(self, mock_get_client, client):
         """The PUT result is always sparse in production (Gmail's
@@ -1435,9 +1379,12 @@ class TestUpdateDraftEndpoint:
         assert "Réunion différente" in data["message"]
     @patch("email_server.get_gmail_client")
     def test_update_draft_with_thread_id(self, mock_get_client, client):
-        mock_proxy = AsyncMock()
-        mock_get_client.return_value = mock_proxy
-        mock_proxy.update_draft.return_value = {"id": "r123"}
+        mock_proxy = _update_proxy(
+            mock_get_client,
+            put={"id": "r123"},
+            post=_draft_resource(to=("alice@example.com",), subject="Re: Thread", body="Updated reply"),
+            pre_read=False,
+        )
 
         response = client.post("/drafts/r123/update", json={
             "to": ["alice@example.com"],
@@ -1447,7 +1394,9 @@ class TestUpdateDraftEndpoint:
         })
 
         assert response.status_code == 200
-        assert response.json()["success"] is True
+        data = response.json()
+        assert data["success"] is True
+        assert data["warnings"] == []
         assert mock_proxy.update_draft.call_args.kwargs["thread_id"] == "thread_abc"
         mock_proxy.list_messages.assert_not_called()
         # The current-thread read is skipped; the only get_draft call is the
@@ -1478,7 +1427,6 @@ class TestUpdateDraftEndpoint:
         """If the current thread can't be read, the update fails — even a
         successful reply lookup could relocate a deliberately detached or
         moved draft, so there is no lookup rescue on update."""
-        from proxy_client import ProxyError
         mock_proxy = AsyncMock()
         mock_get_client.return_value = mock_proxy
         mock_proxy.get_draft.side_effect = ProxyError("proxy 502")
@@ -1502,30 +1450,21 @@ class TestUpdateDraftEndpoint:
         """A 2xx update result whose 'message' is not a dict (e.g. an
         acknowledgment string) must not turn a successful write into a
         reported failure."""
-        mock_proxy = AsyncMock()
-        mock_get_client.return_value = mock_proxy
-        mock_proxy.get_draft.return_value = {
-            "id": "r123",
-            "message": {"id": "msg456", "threadId": "t_keep"},
-        }
-        mock_proxy.update_draft.return_value = {"message": "ok"}
+        _update_proxy(mock_get_client, put={"message": "ok"})
 
-        response = client.post("/drafts/r123/update", json={
-            "to": ["bob@example.com"],
-            "subject": "Updated subject",
-            "body": "Updated body",
-        })
+        response = client.post("/drafts/r123/update", json=UPDATE_BODY)
 
         assert response.status_code == 200
         data = response.json()
         assert data["success"] is True
         assert data["thread_id"] == "t_keep"
+        # The only warning is the honest one: such a result names no id.
+        assert len(data["warnings"]) == 1 and "no draft id" in data["warnings"][0]
 
     @patch("email_server.get_gmail_client")
     def test_update_draft_fails_when_current_thread_lookup_errors(self, mock_get_client, client):
         """If the draft's current thread can't be read, the update fails
         rather than proceeding and silently detaching the draft."""
-        from proxy_client import ProxyError
         mock_proxy = AsyncMock()
         mock_get_client.return_value = mock_proxy
         mock_proxy.get_draft.side_effect = ProxyError("proxy 502")
@@ -1546,12 +1485,17 @@ class TestUpdateDraftEndpoint:
     def test_update_draft_attach_to_thread_false_detaches(self, mock_get_client, client):
         """attach_to_thread=false on update is the deliberate way to detach
         a draft: no lookup, no preservation, no threadId sent."""
-        mock_proxy = AsyncMock()
-        mock_get_client.return_value = mock_proxy
-        mock_proxy.update_draft.return_value = {
-            "id": "r123",
-            "message": {"id": "msg456", "threadId": "t_new"},
-        }
+        mock_proxy = _update_proxy(
+            mock_get_client,
+            put=_draft_resource(thread_id="t_new"),
+            post=_draft_resource(
+                thread_id="t_new",
+                to=("alice@example.com",),
+                subject="New topic (was: Old thread)",
+                body="Fresh conversation",
+            ),
+            pre_read=False,
+        )
 
         response = client.post("/drafts/r123/update", json={
             "to": ["alice@example.com"],
@@ -1564,6 +1508,7 @@ class TestUpdateDraftEndpoint:
         assert response.status_code == 200
         data = response.json()
         assert data["success"] is True
+        assert data["warnings"] == []
         assert data["thread_attached"] is False
         assert mock_proxy.update_draft.call_args.kwargs["thread_id"] is None
         mock_proxy.list_messages.assert_not_called()
@@ -1574,13 +1519,11 @@ class TestUpdateDraftEndpoint:
     @patch("email_server.get_gmail_client")
     def test_update_draft_bare_in_reply_to_header_normalized(self, mock_get_client, client):
         """Update applies the same bracket-wrapping as create."""
-        mock_proxy = AsyncMock()
-        mock_get_client.return_value = mock_proxy
-        mock_proxy.get_draft.return_value = {
-            "id": "r123",
-            "message": {"id": "m123", "threadId": "t_keep"},
-        }
-        mock_proxy.update_draft.return_value = {"id": "r123"}
+        mock_proxy = _update_proxy(
+            mock_get_client,
+            put={"id": "r123"},
+            post=_draft_resource(to=("alice@example.com",), subject="Re: Thread", body="Updated reply"),
+        )
 
         response = client.post("/drafts/r123/update", json={
             "to": ["alice@example.com"],
@@ -1590,6 +1533,7 @@ class TestUpdateDraftEndpoint:
         })
 
         assert response.status_code == 200
+        assert response.json()["warnings"] == []
         raw_msg = mock_proxy.update_draft.call_args[0][1]
         decoded = base64.urlsafe_b64decode(raw_msg).decode("utf-8")
         assert "In-Reply-To: <msg123@example.com>" in decoded
@@ -1599,16 +1543,10 @@ class TestUpdateDraftEndpoint:
         """The draft's current thread embodies past threading decisions
         (including a deliberate detach or explicit thread_id), so an update
         echoing in_reply_to must not re-resolve and relocate the draft."""
-        mock_proxy = AsyncMock()
-        mock_get_client.return_value = mock_proxy
-        mock_proxy.get_draft.return_value = {
-            "id": "r123",
-            "message": {"id": "m123", "threadId": "t_keep"},
-        }
-        mock_proxy.update_draft.return_value = {
-            "id": "r123",
-            "message": {"id": "m123", "threadId": "t_keep"},
-        }
+        mock_proxy = _update_proxy(
+            mock_get_client,
+            post=_draft_resource(to=("alice@example.com",), subject="Re: Thread", body="Updated reply"),
+        )
 
         response = client.post("/drafts/r123/update", json={
             "to": ["alice@example.com"],
@@ -1620,6 +1558,7 @@ class TestUpdateDraftEndpoint:
         assert response.status_code == 200
         data = response.json()
         assert data["success"] is True
+        assert data["warnings"] == []
         assert data["thread_id"] == "t_keep"
         assert data["thread_attached"] is True
         assert mock_proxy.update_draft.call_args.kwargs["thread_id"] == "t_keep"
@@ -1631,16 +1570,14 @@ class TestUpdateDraftEndpoint:
         no current thread to preserve — Gmail gives every message a
         threadId, so a lookup here would be unreachable in production and
         moving a draft must be explicit (thread_id)."""
-        mock_proxy = AsyncMock()
-        mock_get_client.return_value = mock_proxy
-        mock_proxy.get_draft.return_value = {
-            "id": "r123",
-            "message": {"id": "m123"},
-        }
-        mock_proxy.update_draft.return_value = {
-            "id": "r123",
-            "message": {"id": "m123", "threadId": "t_new"},
-        }
+        mock_proxy = _update_proxy(
+            mock_get_client,
+            pre={"id": "r123", "message": {"id": "m123"}},
+            put=_draft_resource(thread_id="t_new"),
+            post=_draft_resource(
+                thread_id="t_new", to=("alice@example.com",), subject="Re: Thread", body="Updated reply"
+            ),
+        )
 
         response = client.post("/drafts/r123/update", json={
             "to": ["alice@example.com"],
@@ -1652,6 +1589,7 @@ class TestUpdateDraftEndpoint:
         assert response.status_code == 200
         data = response.json()
         assert data["success"] is True
+        assert data["warnings"] == []
         mock_proxy.list_messages.assert_not_called()
         assert mock_proxy.update_draft.call_args.kwargs["thread_id"] is None
 
@@ -2293,7 +2231,6 @@ class TestDeleteDraftEndpoint:
 
     @patch("email_server.get_gmail_client")
     def test_delete_draft_error(self, mock_get_client, client):
-        from proxy_client import ProxyError
         mock_proxy = AsyncMock()
         mock_get_client.return_value = mock_proxy
         mock_proxy.delete_draft.side_effect = ProxyError("Draft not found")
