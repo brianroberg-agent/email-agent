@@ -56,7 +56,7 @@ The test suite uses mocked proxy client and LLM responses - no credentials requi
 
 ## Key Design Decisions
 
-1. **Privacy**: Email bodies are processed locally via a local LLM (Qwen3-14B). The calling agent only sees metadata and summaries.
+1. **Privacy**: Email bodies are processed locally via the local LLM at `MLX_URL` (model `MLX_MODEL`). The calling agent only sees metadata and summaries.
 
 2. **Proxy Architecture**: All Gmail API requests go through a proxy server that handles Google OAuth and human-in-the-loop controls. The agent no longer possesses a Google auth token.
 

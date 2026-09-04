@@ -1627,9 +1627,16 @@ class TestBackendWording:
 
 
 class TestEnvVarDocParity:
-    """Every environment variable the code reads is documented, with the same
-    default, in README.md (env table), CLAUDE.md (env list) and .env.example.
-    Guards the drift that let three docs describe LLM_BACKEND_NAME three ways."""
+    """Every environment variable read via the two-argument
+    `os.environ.get("VAR", "default")` form in email_server.py and
+    proxy_client.py is documented, with the same default, in README.md (env
+    table), CLAUDE.md (env list) and .env.example. Guards the drift that let
+    three docs describe LLM_BACKEND_NAME three ways.
+
+    Does NOT scan setup_oauth.py or single-argument `os.environ.get("VAR")`
+    calls -- GOOGLE_CLIENT_ID/GOOGLE_CLIENT_SECRET (required by
+    setup_oauth.py, not read by the server) are documented separately via the
+    README "OAuth Setup" note and .env.example, outside this check."""
 
     ENV_GET = re.compile(r'os\.environ\.get\(\s*"([A-Z_]+)"\s*,\s*"([^"]*)"\s*\)')
 
@@ -1656,6 +1663,16 @@ class TestEnvVarDocParity:
                     f"{var} missing from .env.example"
                 )
 
+    @staticmethod
+    def _claude_md_default_line(claude_md, var):
+        """The CLAUDE.md line documenting `var`'s default -- the first line
+        mentioning both `` `var` `` and "default:", not just the first
+        backticked mention of var (which could be unrelated prose)."""
+        for line in claude_md.splitlines():
+            if f"`{var}`" in line and "default:" in line:
+                return line
+        return None
+
     def test_documented_defaults_match_code(self, subtests):
         root, env_vars = self._code_env_vars()
         readme = (root / "README.md").read_text()
@@ -1670,8 +1687,12 @@ class TestEnvVarDocParity:
                 assert row.group(1) == default, (
                     f"README says {var} defaults to {row.group(1)!r}; code says {default!r}"
                 )
-                assert f"`{var}`" in claude_md and f"(default: `{default}`)" in claude_md.split(f"`{var}`", 1)[1].split("\n", 1)[0], (
-                    f"CLAUDE.md line for {var} does not state (default: `{default}`)"
+                doc_line = self._claude_md_default_line(claude_md, var)
+                assert doc_line is not None, (
+                    f"CLAUDE.md has no line documenting {var}'s default"
+                )
+                assert f"(default: `{default}`)" in doc_line, (
+                    f"CLAUDE.md line for {var} does not state (default: `{default}`): {doc_line!r}"
                 )
 
 
