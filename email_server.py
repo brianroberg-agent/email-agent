@@ -228,6 +228,9 @@ class ApplyLabelRequest(BaseModel):
 class ActionResponse(BaseModel):
     success: bool
     message: str
+    # Set (with success=false) when the proxy's approval gate declines a gated
+    # operation — see POST /trash. None on success.
+    error: Optional[str] = None
 
 
 class HealthResponse(BaseModel):
@@ -1064,6 +1067,18 @@ async def trash(request: EmailIdRequest):
         await client.trash_message(request.email_id)
         return ActionResponse(success=True, message="Email moved to Trash")
 
+    except ProxyForbiddenError as e:
+        # The proxy said no: the operator declined at the approval gate, or the
+        # proxy's approval window expired with no decision (it answers both
+        # with the same 403 "Request rejected by operator"). That is a normal
+        # outcome of a gated operation, not a server fault, so report it in
+        # the documented error envelope rather than as a 500 — a 500 reads as
+        # "the service broke, retry", and a retry re-prompts the operator.
+        return ActionResponse(
+            success=False,
+            message="Email not moved to Trash: the proxy declined the request (approval not granted)",
+            error=format_proxy_error(e),
+        )
     except Exception as e:
         raise HTTPException(status_code=500, detail=format_proxy_error(e))
 
@@ -1076,6 +1091,13 @@ async def untrash(request: EmailIdRequest):
         await client.untrash_message(request.email_id)
         return ActionResponse(success=True, message="Email removed from Trash")
 
+    except ProxyForbiddenError as e:
+        # Same approval-gate outcome as /trash — see the comment there.
+        return ActionResponse(
+            success=False,
+            message="Email not removed from Trash: the proxy declined the request (approval not granted)",
+            error=format_proxy_error(e),
+        )
     except Exception as e:
         raise HTTPException(status_code=500, detail=format_proxy_error(e))
 
