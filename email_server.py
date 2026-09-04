@@ -790,6 +790,10 @@ def draft_success_response(
     )
 
 
+# Labels whose application is refused by resolve_label_id (see there).
+TRASH_SPAM_LABELS = {"TRASH", "SPAM"}
+
+
 async def resolve_label_id(client, label_name: str) -> str:
     """Resolve a label name to its Gmail label ID.
 
@@ -805,8 +809,21 @@ async def resolve_label_id(client, label_name: str) -> str:
         The label ID to use with Gmail API.
 
     Raises:
-        ValueError: If the label name is not found.
+        ValueError: If the label name is TRASH or SPAM (see below), or if a
+            user label of that name is not found.
     """
+    # TRASH/SPAM are refused here -- the one place every label route resolves
+    # through -- because applying them as labels bypasses the proxy's approval
+    # gate for destructive operations (api-proxy#2). POST /trash and
+    # POST /untrash are the gated equivalents. Any future label route
+    # inherits this refusal by going through resolve_label_id.
+    if label_name.upper() in TRASH_SPAM_LABELS:
+        raise ValueError(
+            f"apply_label cannot be used for '{label_name}' — this bypasses the "
+            f"proxy's approval gate for destructive operations. Use POST /trash "
+            f"(or /untrash) instead."
+        )
+
     # System labels have IDs matching their names - check common ones first
     system_labels = {
         "INBOX", "STARRED", "IMPORTANT", "SENT", "DRAFT", "SPAM", "TRASH",
@@ -823,25 +840,6 @@ async def resolve_label_id(client, label_name: str) -> str:
             return label.get("id")
 
     raise ValueError(f"Label '{label_name}' not found")
-
-
-# Applying TRASH/SPAM via the label-modify path bypasses the proxy's
-# approval gate for destructive operations (see api-proxy#2) — /trash and
-# /untrash are the sanctioned, gated equivalents. Reject these labels
-# wherever apply_label is reachable (both the dedicated route and the
-# bulk-actions per-operation path) rather than in one place only.
-TRASH_SPAM_LABELS = {"TRASH", "SPAM"}
-
-
-def trash_spam_label_rejection(label_name: str) -> Optional[str]:
-    """Error text for a TRASH/SPAM apply_label attempt, or None if allowed."""
-    if label_name.upper() not in TRASH_SPAM_LABELS:
-        return None
-    return (
-        f"apply_label cannot be used for '{label_name}' — this bypasses the "
-        f"proxy's approval gate for destructive operations. Use POST /trash "
-        f"(or /untrash) instead."
-    )
 
 
 async def apply_single_operation(client, email_id: str, operation: str) -> tuple[bool, str]:
@@ -864,10 +862,7 @@ async def apply_single_operation(client, email_id: str, operation: str) -> tuple
             label_name = operation.split(":", 1)[1]
             if not label_name:
                 return False, "apply_label requires a label name (e.g., 'apply_label:IMPORTANT')"
-            rejection = trash_spam_label_rejection(label_name)
-            if rejection:
-                return False, rejection
-            label_id = await resolve_label_id(client, label_name)
+            label_id = await resolve_label_id(client, label_name)  # refuses TRASH/SPAM
             await client.modify_message(email_id, add_label_ids=[label_id])
         else:
             return False, f"Unknown operation: {operation}"
@@ -1026,12 +1021,10 @@ async def mark_read(request: EmailIdRequest):
 async def apply_label(request: ApplyLabelRequest):
     """Apply a label to an email.
 
-    TRASH and SPAM are rejected here — see POST /trash and POST /untrash,
-    which route through the proxy's approval-gated trash endpoint instead.
+    TRASH and SPAM are rejected (400) by resolve_label_id — see POST /trash
+    and POST /untrash, which route through the proxy's approval-gated trash
+    endpoint instead.
     """
-    rejection = trash_spam_label_rejection(request.label_name)
-    if rejection:
-        raise HTTPException(status_code=400, detail=rejection)
     try:
         client = get_gmail_client()
         label_id = await resolve_label_id(client, request.label_name)
