@@ -35,9 +35,37 @@ class ProxyAuthError(Exception):
     pass
 
 
+# The body the proxy's approval gate answers with when the operator declines
+# a request -- or when its approval window expires with no decision
+# (api-proxy gmail/handlers.py, handle_confirmation). This is the only 403
+# that is a human decision; the proxy also answers 403 for a disabled API
+# key (error "auth_error") and for a blocked or non-allowlisted path (error
+# "forbidden", message "This operation is not allowed").
+OPERATOR_DECLINE_CODE = "forbidden"
+OPERATOR_DECLINE_MESSAGE = "Request rejected by operator"
+
+
 class ProxyForbiddenError(Exception):
-    """Raised when proxy returns 403 Forbidden (blocked operation or rejected confirmation)."""
-    pass
+    """Raised when proxy returns 403 Forbidden (blocked operation, disabled
+    key, or rejected confirmation).
+
+    `code` is the proxy's `error` field (None if the body had none), kept so
+    callers can tell the approval gate's answer from an infrastructure 403.
+    """
+
+    def __init__(self, message: str, code: Optional[str] = None):
+        super().__init__(message)
+        self.code = code
+
+    @property
+    def is_operator_decline(self) -> bool:
+        """True only for the approval gate's own answer (see
+        OPERATOR_DECLINE_*). A 403 with any other code or message -- or one
+        whose body could not be parsed -- is not a human decision."""
+        return (
+            self.code == OPERATOR_DECLINE_CODE
+            and str(self) == OPERATOR_DECLINE_MESSAGE
+        )
 
 
 class ProxyError(Exception):
@@ -83,6 +111,16 @@ class GmailProxyClient:
             # Response is not valid JSON or doesn't have expected structure
             return default
 
+    def _parse_error_code(self, response: httpx.Response) -> Optional[str]:
+        """Extract the proxy's `error` code from an error body, if any."""
+        if not response.content:
+            return None
+        try:
+            code = response.json().get("error")
+        except (ValueError, AttributeError):
+            return None
+        return code if isinstance(code, str) else None
+
     def _handle_response(self, response: httpx.Response) -> dict:
         """Handle proxy response and raise appropriate exceptions.
 
@@ -103,7 +141,7 @@ class GmailProxyClient:
 
         if response.status_code == 403:
             message = self._parse_error_message(response, "Forbidden - operation blocked or rejected")
-            raise ProxyForbiddenError(message)
+            raise ProxyForbiddenError(message, code=self._parse_error_code(response))
 
         if response.status_code >= 500:
             message = self._parse_error_message(response, f"Proxy error: {response.status_code}")

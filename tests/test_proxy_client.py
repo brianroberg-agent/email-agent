@@ -57,3 +57,63 @@ class TestGatedRouteTimeouts:
             await proxy.modify_message("msg123", remove_label_ids=["UNREAD"])
 
         assert _read_timeout(cls.call_args.kwargs["timeout"]) == 30.0
+
+
+def _response(status_code, payload):
+    response = MagicMock()
+    response.status_code = status_code
+    response.content = b"{}"
+    response.json.return_value = payload
+    return response
+
+
+class TestForbiddenErrorCarriesProxyErrorCode:
+    """The proxy answers three different situations with a 403: the approval
+    gate's decision (`forbidden` / "Request rejected by operator" -- also its
+    answer when the approval window expires), a disabled API key
+    (`auth_error`), and a blocked or non-allowlisted path (`forbidden` /
+    "This operation is not allowed"). Only the first is a human decision;
+    the client must keep the proxy's `error` code so a route can tell them
+    apart instead of reporting every 403 as a decline."""
+
+    @pytest.mark.parametrize("payload,code", [
+        ({"error": "forbidden", "message": "Request rejected by operator"}, "forbidden"),
+        ({"error": "auth_error", "message": "API key is disabled"}, "auth_error"),
+        ({"error": "forbidden", "message": "This operation is not allowed"}, "forbidden"),
+    ])
+    def test_403_preserves_error_code_and_message(self, payload, code):
+        from proxy_client import ProxyForbiddenError
+
+        proxy = GmailProxyClient(proxy_url="http://proxy", api_key="key")
+        with pytest.raises(ProxyForbiddenError) as excinfo:
+            proxy._handle_response(_response(403, payload))
+        assert excinfo.value.code == code
+        assert str(excinfo.value) == payload["message"]
+
+    def test_403_without_json_body_has_no_code(self):
+        from proxy_client import ProxyForbiddenError
+
+        response = MagicMock()
+        response.status_code = 403
+        response.content = b""
+        proxy = GmailProxyClient(proxy_url="http://proxy", api_key="key")
+        with pytest.raises(ProxyForbiddenError) as excinfo:
+            proxy._handle_response(response)
+        assert excinfo.value.code is None
+
+    @pytest.mark.parametrize("message,code,expected", [
+        ("Request rejected by operator", "forbidden", True),
+        ("API key is disabled", "auth_error", False),
+        ("This operation is not allowed", "forbidden", False),
+        ("Request rejected by operator", None, False),
+        ("Forbidden - operation blocked or rejected", None, False),
+    ])
+    def test_is_operator_decline_matches_only_the_gate_signature(
+        self, message, code, expected
+    ):
+        """Pure predicate over (code, message): only the gate's exact answer
+        counts as a decline. Anything else -- including a 403 whose body
+        could not be parsed -- is treated as a service fault."""
+        from proxy_client import ProxyForbiddenError
+
+        assert ProxyForbiddenError(message, code=code).is_operator_decline is expected

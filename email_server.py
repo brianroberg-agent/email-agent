@@ -229,7 +229,7 @@ class ActionResponse(BaseModel):
     success: bool
     message: str
     # Set (with success=false) when the proxy's approval gate declines a gated
-    # operation — see POST /trash. None on success.
+    # operation — see gated_action_refused / POST /trash. None on success.
     error: Optional[str] = None
 
 
@@ -1071,6 +1071,26 @@ async def archive(request: EmailIdRequest):
         raise HTTPException(status_code=500, detail=format_proxy_error(e))
 
 
+def gated_action_refused(e: ProxyForbiddenError, message: str) -> ActionResponse:
+    """Map a proxy 403 on an approval-gated route (/trash, /untrash).
+
+    The operator declining at the approval gate -- or the proxy's approval
+    window expiring with no decision; the proxy answers both with the same
+    403 -- is a normal outcome of a gated operation, not a server fault, so
+    it is reported in the documented error envelope rather than as a 500: a
+    500 reads as "the service broke, retry", and a retry re-prompts the
+    operator.
+
+    Any other 403 -- a disabled API key, a blocked or non-allowlisted path --
+    is an infrastructure fault that no human decided, so it stays a 500.
+    Reporting it as a decline would tell the operator he refused a request
+    he was never shown.
+    """
+    if not e.is_operator_decline:
+        raise HTTPException(status_code=500, detail=format_proxy_error(e))
+    return ActionResponse(success=False, message=message, error=format_proxy_error(e))
+
+
 @app.post("/trash", response_model=ActionResponse)
 async def trash(request: EmailIdRequest):
     """Move an email to Trash.
@@ -1087,16 +1107,8 @@ async def trash(request: EmailIdRequest):
         return ActionResponse(success=True, message="Email moved to Trash")
 
     except ProxyForbiddenError as e:
-        # The proxy said no: the operator declined at the approval gate, or the
-        # proxy's approval window expired with no decision (it answers both
-        # with the same 403 "Request rejected by operator"). That is a normal
-        # outcome of a gated operation, not a server fault, so report it in
-        # the documented error envelope rather than as a 500 — a 500 reads as
-        # "the service broke, retry", and a retry re-prompts the operator.
-        return ActionResponse(
-            success=False,
-            message="Email not moved to Trash: the proxy declined the request (approval not granted)",
-            error=format_proxy_error(e),
+        return gated_action_refused(
+            e, "Email not moved to Trash: the proxy declined the request (approval not granted)"
         )
     except Exception as e:
         raise HTTPException(status_code=500, detail=format_proxy_error(e))
@@ -1111,11 +1123,8 @@ async def untrash(request: EmailIdRequest):
         return ActionResponse(success=True, message="Email removed from Trash")
 
     except ProxyForbiddenError as e:
-        # Same approval-gate outcome as /trash — see the comment there.
-        return ActionResponse(
-            success=False,
-            message="Email not removed from Trash: the proxy declined the request (approval not granted)",
-            error=format_proxy_error(e),
+        return gated_action_refused(
+            e, "Email not removed from Trash: the proxy declined the request (approval not granted)"
         )
     except Exception as e:
         raise HTTPException(status_code=500, detail=format_proxy_error(e))

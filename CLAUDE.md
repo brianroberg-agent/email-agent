@@ -74,7 +74,7 @@ The test suite uses mocked proxy client and LLM responses - no credentials requi
 - `POST /mark-read` - Mark email as read
 - `POST /apply-label` - Apply a label to an email (rejects TRASH/SPAM — use /trash instead, which routes through the proxy's approval gate)
 - `POST /archive` - Archive an email
-- `POST /trash` - Move an email to Trash via the proxy's gated trash route (the sanctioned delete path). Waits up to 330 s for the operator's decision (`APPROVAL_GATE_TIMEOUT` in `proxy_client.py`, sized to outlast the proxy's 300 s approval window); a decline returns `success: false` with an `Operation blocked:` error, not a 500
+- `POST /trash` - Move an email to Trash via the proxy's gated trash route (the sanctioned delete path). Waits up to 330 s for the operator's decision (`APPROVAL_GATE_TIMEOUT` in `proxy_client.py`, sized to outlast the proxy's 300 s approval window); a decline at the gate returns `success: false` with an `Operation blocked:` error, not a 500 (any other proxy 403 — disabled key, blocked path — is still a 500)
 - `POST /untrash` - Remove an email from Trash (gated the same way as `/trash`)
 - `POST /batch-summarize` - Summarize multiple emails with triage info (detected_action, detected_deadline)
 - `POST /bulk-actions` - Apply multiple operations to multiple emails (`mark_read`, `archive`, `trash`, `apply_label:NAME`; `trash` is one approval-gated proxy call per message, so N messages means N operator approvals)

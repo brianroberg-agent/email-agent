@@ -2348,7 +2348,7 @@ class TestTrashApprovalDecline:
         mock_proxy_client = AsyncMock()
         mock_get_client.return_value = mock_proxy_client
         getattr(mock_proxy_client, method).side_effect = ProxyForbiddenError(
-            "Request rejected by operator"
+            "Request rejected by operator", code="forbidden"
         )
 
         response = client.post(route, json={"email_id": "msg123"})
@@ -2358,6 +2358,36 @@ class TestTrashApprovalDecline:
         assert data["success"] is False
         assert data["error"].startswith("Operation blocked:")
         assert "Request rejected by operator" in data["error"]
+        assert "approval not granted" in data["message"]
+
+    @patch("email_server.get_gmail_client")
+    @pytest.mark.parametrize("route,method", [
+        ("/trash", "trash_message"),
+        ("/untrash", "untrash_message"),
+    ])
+    @pytest.mark.parametrize("message,code", [
+        ("API key is disabled", "auth_error"),          # proxy auth.py: disabled key
+        ("This operation is not allowed", "forbidden"),  # proxy main.py: blocked/non-allowlisted path
+        ("Request rejected by operator", None),          # 403 whose body could not be parsed
+    ])
+    def test_non_decline_403_is_still_a_500(
+        self, mock_get_client, client, route, method, message, code
+    ):
+        """A proxy 403 that is not the approval gate's answer -- a disabled
+        API key, a blocked or non-allowlisted path -- is a service fault.
+        Reporting it in the decline envelope would tell the operator he
+        declined a request he was never shown."""
+        from proxy_client import ProxyForbiddenError
+
+        mock_proxy_client = AsyncMock()
+        mock_get_client.return_value = mock_proxy_client
+        getattr(mock_proxy_client, method).side_effect = ProxyForbiddenError(
+            message, code=code
+        )
+
+        response = client.post(route, json={"email_id": "msg123"})
+        assert response.status_code == 500, response.text
+        assert response.json()["detail"] == f"Operation blocked: {message}"
 
     @patch("email_server.get_gmail_client")
     def test_trash_success_envelope_has_null_error(self, mock_get_client, client):
@@ -2421,7 +2451,7 @@ class TestBulkActionsTrash:
         mock_proxy_client = AsyncMock()
         mock_get_client.return_value = mock_proxy_client
         mock_proxy_client.trash_message.side_effect = [
-            ProxyForbiddenError("Request rejected by operator"),
+            ProxyForbiddenError("Request rejected by operator", code="forbidden"),
             {"id": "msg_b"},
         ]
 

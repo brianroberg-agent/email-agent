@@ -282,7 +282,7 @@ Response:
 
 The proxy holds the request open while the operator decides, so this call waits **up to 330 s** for the proxy's answer (`APPROVAL_GATE_TIMEOUT` in `proxy_client.py`, sized to outlast the proxy's default 300 s approval window) — much longer than the 30 s used for ungated calls. Give it that long on the calling side too: a client-side timeout shorter than the approval window reports failure for a trash that may then be approved and go through.
 
-If the operator declines the request at the approval gate — or the proxy's approval window expires with no decision; the proxy reports both the same way — the response is the documented error envelope (HTTP 200, `success: false`), not an HTTP error:
+If the operator declines the request at the approval gate — or the proxy's approval window expires with no decision; the proxy reports both the same way — the response is the documented error envelope (HTTP 200, `success: false`), not an HTTP error. Only the gate's own answer is mapped this way; a 403 for a disabled API key or a blocked path is still a 500 (see [Error Handling](#error-handling)):
 
 ```json
 {"success": false, "message": "Email not moved to Trash: the proxy declined the request (approval not granted)", "error": "Operation blocked: Request rejected by operator"}
@@ -515,7 +515,7 @@ Error prefixes indicate the type:
 - `Operation blocked:` - Operation not allowed or confirmation rejected (proxy returned 403)
 - `Proxy error:` - Backend or server error (proxy returned 5xx)
 
-`POST /trash` and `POST /untrash` return this envelope (HTTP 200, `success: false`, plus a `message`) when the proxy declines at its approval gate. Other failures on the single-action endpoints (`/mark-read`, `/apply-label`, `/archive`, `/trash`, `/untrash`) are still HTTP 500 with a `detail` string.
+`POST /trash` and `POST /untrash` return this envelope (HTTP 200, `success: false`, plus a `message`) only when the proxy's approval gate itself answers the request (`{"error": "forbidden", "message": "Request rejected by operator"}` — an operator decline, or an expired approval window). A proxy 403 with any other body — a disabled API key (`auth_error`), a blocked or non-allowlisted path (`This operation is not allowed`) — is an infrastructure fault no human decided, and stays HTTP 500 with the proxy's text in `detail`. Other failures on the single-action endpoints (`/mark-read`, `/apply-label`, `/archive`, `/trash`, `/untrash`) are still HTTP 500 with a `detail` string.
 
 ## Development
 
