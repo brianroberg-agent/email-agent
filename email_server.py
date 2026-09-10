@@ -794,8 +794,25 @@ def draft_success_response(
     )
 
 
-# Labels whose application is refused by resolve_label_id (see there).
+# Labels whose application is refused by refuse_trash_spam (see there).
 TRASH_SPAM_LABELS = {"TRASH", "SPAM"}
+
+
+def refuse_trash_spam(label_name: str) -> None:
+    """Pure rule: raise ValueError if label_name is TRASH or SPAM.
+
+    Applying either as a label bypasses the proxy's approval gate for
+    destructive operations (api-proxy#2). POST /trash and POST /untrash are
+    the gated equivalents. Kept free of I/O so the rule is testable without
+    a client; resolve_label_id calls it first so every label route inherits
+    the refusal.
+    """
+    if label_name.upper() in TRASH_SPAM_LABELS:
+        raise ValueError(
+            f"apply_label cannot be used for '{label_name}' — this bypasses the "
+            f"proxy's approval gate for destructive operations. Use POST /trash "
+            f"(or /untrash) instead."
+        )
 
 
 async def resolve_label_id(client, label_name: str) -> str:
@@ -816,17 +833,10 @@ async def resolve_label_id(client, label_name: str) -> str:
         ValueError: If the label name is TRASH or SPAM (see below), or if a
             user label of that name is not found.
     """
-    # TRASH/SPAM are refused here -- the one place every label route resolves
-    # through -- because applying them as labels bypasses the proxy's approval
-    # gate for destructive operations (api-proxy#2). POST /trash and
-    # POST /untrash are the gated equivalents. Any future label route
-    # inherits this refusal by going through resolve_label_id.
-    if label_name.upper() in TRASH_SPAM_LABELS:
-        raise ValueError(
-            f"apply_label cannot be used for '{label_name}' — this bypasses the "
-            f"proxy's approval gate for destructive operations. Use POST /trash "
-            f"(or /untrash) instead."
-        )
+    # Refused here -- the one place every label route resolves through -- and
+    # before any proxy I/O. Any future label route inherits the refusal by
+    # going through resolve_label_id.
+    refuse_trash_spam(label_name)
 
     # System labels have IDs matching their names - check common ones first
     system_labels = {

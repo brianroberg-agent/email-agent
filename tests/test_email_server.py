@@ -2295,13 +2295,28 @@ class TestResolveLabelIdRefusesTrashSpam:
     destructive operations (api-proxy#2); POST /trash is the gated path."""
 
     @pytest.mark.parametrize("label", ["TRASH", "SPAM", "trash", "Spam"])
-    async def test_resolve_label_id_refuses_trash_and_spam(self, label):
+    def test_refuse_trash_spam_is_a_pure_string_rule(self, label):
+        """The refusal is a pure function of the label name: testable with
+        no client, no mock, no event loop."""
+        from email_server import refuse_trash_spam
+
+        with pytest.raises(ValueError, match="/trash"):
+            refuse_trash_spam(label)
+
+    @pytest.mark.parametrize("label", ["STARRED", "INBOX", "Work", ""])
+    def test_refuse_trash_spam_lets_other_labels_through(self, label):
+        from email_server import refuse_trash_spam
+
+        assert refuse_trash_spam(label) is None
+
+    async def test_resolve_label_id_refuses_before_any_proxy_round_trip(self):
+        """The choke-point property: every label route resolves through
+        resolve_label_id, and the refusal runs there before any I/O."""
         from email_server import resolve_label_id
 
         mock_proxy_client = AsyncMock()
         with pytest.raises(ValueError, match="/trash"):
-            await resolve_label_id(mock_proxy_client, label)
-        # Refused before any proxy round-trip.
+            await resolve_label_id(mock_proxy_client, "TRASH")
         mock_proxy_client.list_labels.assert_not_called()
 
     async def test_resolve_label_id_still_resolves_other_system_labels(self):
