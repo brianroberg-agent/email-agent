@@ -2508,3 +2508,22 @@ class TestBulkActionsTrash:
         assert "trash: Operation blocked: API key is disabled" in data["results"][0]["error"]
         assert "trash: not attempted" in data["results"][1]["error"]
         mock_proxy_client.trash_message.assert_called_once_with("msg_a")
+
+
+class TestBulkOperationsSchemaListsEveryOperation:
+    """The OpenAPI description of EmailAction.operations is what a caller
+    reading /openapi.json sees; it must name every BulkOperation member
+    (plus the apply_label:NAME form), or a caller concludes bulk trash is
+    unsupported and falls back to N single calls -- or to apply_label:TRASH,
+    which is refused."""
+
+    def test_openapi_operations_description_names_every_bulk_operation(self, client):
+        from email_server import BulkOperation
+
+        schema = client.get("/openapi.json").json()
+        description = schema["components"]["schemas"]["EmailAction"]["properties"]["operations"]["description"]
+        for member in BulkOperation:
+            assert f"'{member.value}'" in description, (
+                f"{member.value!r} missing from the operations description: {description!r}"
+            )
+        assert "'apply_label:LABEL_NAME'" in description

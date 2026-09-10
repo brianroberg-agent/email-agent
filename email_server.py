@@ -297,7 +297,11 @@ class EmailAction(BaseModel):
     email_id: str = Field(..., description="Email ID to act on")
     operations: list[str] = Field(
         ...,
-        description="Operations to apply: 'mark_read', 'archive', 'apply_label:LABEL_NAME'"
+        description=(
+            "Operations to apply: 'mark_read', 'archive', 'trash' (approval-gated, "
+            "one operator decision per message), 'apply_label:LABEL_NAME' "
+            "(TRASH/SPAM refused -- use 'trash')"
+        ),
     )
 
 
