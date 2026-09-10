@@ -227,7 +227,7 @@ curl -X POST http://localhost:8081/mark-read \
 
 Response:
 ```json
-{"success": true, "message": "Email marked as read"}
+{"success": true, "message": "Email marked as read", "error": null}
 ```
 
 ### POST /apply-label
@@ -242,7 +242,7 @@ curl -X POST http://localhost:8081/apply-label \
 
 Response:
 ```json
-{"success": true, "message": "Label 'STARRED' applied"}
+{"success": true, "message": "Label 'STARRED' applied", "error": null}
 ```
 
 **TRASH and SPAM are rejected here (400)** — applying either via the label-modify path bypasses the proxy's approval gate for destructive operations. Use `POST /trash` (or `POST /untrash`) instead, which routes through the proxy's gated trash endpoint. The same rejection applies to `apply_label:TRASH`/`apply_label:SPAM` operations passed to `/bulk-actions`.
@@ -263,7 +263,7 @@ curl -X POST http://localhost:8081/archive \
 
 Response:
 ```json
-{"success": true, "message": "Email archived"}
+{"success": true, "message": "Email archived", "error": null}
 ```
 
 ### POST /trash
@@ -480,7 +480,7 @@ curl -X DELETE http://localhost:8081/drafts/{draft_id}
 
 Response:
 ```json
-{"success": true, "message": "Draft deleted: r1234567890"}
+{"success": true, "message": "Draft deleted: r1234567890", "error": null}
 ```
 
 ## Proxy Server
