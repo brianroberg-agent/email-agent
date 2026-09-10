@@ -2445,7 +2445,13 @@ class TestBulkActionsTrash:
             assert "TRASH" not in (c.kwargs.get("add_label_ids") or [])
 
     @patch("email_server.get_gmail_client")
-    def test_bulk_trash_operator_decline_is_per_message(self, mock_get_client, client):
+    def test_bulk_stops_at_the_first_proxy_refusal(self, mock_get_client, client):
+        """A proxy 403 on one message ends the request: the remaining
+        operations are reported as not attempted, never sent. The proxy
+        answers an operator decline and an expired approval window with the
+        same 403, so continuing would queue one more stale prompt per
+        remaining message for an operator who may be absent (each waiting a
+        full approval window); the caller re-issues the rest instead."""
         from proxy_client import ProxyForbiddenError
 
         mock_proxy_client = AsyncMock()
@@ -2457,14 +2463,48 @@ class TestBulkActionsTrash:
 
         data = client.post("/bulk-actions", json={
             "actions": [
-                {"email_id": "msg_a", "operations": ["trash"]},
-                {"email_id": "msg_b", "operations": ["trash"]},
+                {"email_id": "msg_ok", "operations": ["mark_read"]},
+                {"email_id": "msg_a", "operations": ["trash", "archive"]},
+                {"email_id": "msg_b", "operations": ["mark_read", "trash"]},
             ]
         }).json()
 
         assert data["success"] is True  # overall request always 200s
         assert data["success_count"] == 1
-        assert data["error_count"] == 1
-        assert data["results"][0]["success"] is False
-        assert "Operation blocked: Request rejected by operator" in data["results"][0]["error"]
-        assert data["results"][1]["success"] is True
+        assert data["error_count"] == 2
+        assert data["results"][0]["success"] is True
+        assert data["results"][1]["success"] is False
+        assert "trash: Operation blocked: Request rejected by operator" in data["results"][1]["error"]
+        assert "archive: not attempted" in data["results"][1]["error"]
+        assert data["results"][2]["success"] is False
+        assert "mark_read: not attempted" in data["results"][2]["error"]
+        assert "trash: not attempted" in data["results"][2]["error"]
+
+        # Only the first trash reached the proxy; nothing after the refusal did.
+        mock_proxy_client.trash_message.assert_called_once_with("msg_a")
+        mock_proxy_client.modify_message.assert_called_once()  # msg_ok's mark_read only
+
+    @patch("email_server.get_gmail_client")
+    def test_bulk_stops_on_a_non_decline_403_too(self, mock_get_client, client):
+        """A disabled key or blocked path is a 403 as well; the rest of the
+        request cannot succeed either, and the per-message error carries
+        the proxy's real reason rather than a decline."""
+        from proxy_client import ProxyForbiddenError
+
+        mock_proxy_client = AsyncMock()
+        mock_get_client.return_value = mock_proxy_client
+        mock_proxy_client.trash_message.side_effect = ProxyForbiddenError(
+            "API key is disabled", code="auth_error"
+        )
+
+        data = client.post("/bulk-actions", json={
+            "actions": [
+                {"email_id": "msg_a", "operations": ["trash"]},
+                {"email_id": "msg_b", "operations": ["trash"]},
+            ]
+        }).json()
+
+        assert data["error_count"] == 2
+        assert "trash: Operation blocked: API key is disabled" in data["results"][0]["error"]
+        assert "trash: not attempted" in data["results"][1]["error"]
+        mock_proxy_client.trash_message.assert_called_once_with("msg_a")

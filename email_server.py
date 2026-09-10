@@ -876,9 +876,9 @@ async def apply_single_operation(client, email_id: str, operation: str) -> tuple
         elif operation == "trash":
             # Same gated proxy route as POST /trash — the proxy has no batch
             # approval, so a bulk trash is one operator decision per message
-            # (each waiting up to APPROVAL_GATE_TIMEOUT). A decline lands in
-            # this message's error as "Operation blocked: ..." and the
-            # remaining messages are still attempted.
+            # (each waiting up to APPROVAL_GATE_TIMEOUT). A proxy refusal
+            # propagates as ProxyForbiddenError so bulk_actions can stop the
+            # request there (see the loop in bulk_actions).
             await client.trash_message(email_id)
         elif operation.startswith("apply_label:"):
             label_name = operation.split(":", 1)[1]
@@ -891,6 +891,8 @@ async def apply_single_operation(client, email_id: str, operation: str) -> tuple
         return True, ""
     except ValueError as e:
         return False, str(e)
+    except ProxyForbiddenError:
+        raise  # the caller decides whether the request continues
     except Exception as e:
         return False, format_proxy_error(e)
 
@@ -1217,18 +1219,38 @@ async def bulk_actions(request: BulkActionsRequest):
     - trash: Move to Trash via the proxy's approval-gated trash route (one
       approval per message; see POST /trash)
     - apply_label:LABEL_NAME: Add the specified label (TRASH/SPAM rejected)
+
+    The request stops at the first proxy refusal (a 403 -- an operator
+    decline, an expired approval window, a disabled key or a blocked path):
+    every operation after it is reported as "not attempted" and never sent.
+    The proxy answers a decline and an expired window with the same 403, so
+    continuing would queue one more prompt per remaining message for an
+    operator who may be absent, each waiting a full approval window. The
+    caller re-issues the not-attempted operations when it wants them.
     """
     try:
         client = get_gmail_client()
         results = []
         success_count = 0
         error_count = 0
+        # Set to the first proxy refusal's text; once set, nothing else is sent.
+        refused: Optional[str] = None
 
         for action in request.actions:
             email_errors = []
 
             for operation in action.operations:
-                success, error = await apply_single_operation(client, action.email_id, operation)
+                if refused is not None:
+                    email_errors.append(
+                        f"{operation}: not attempted — the proxy refused an earlier "
+                        f"operation in this request ({refused}); re-issue this one separately"
+                    )
+                    continue
+                try:
+                    success, error = await apply_single_operation(client, action.email_id, operation)
+                except ProxyForbiddenError as e:
+                    success, error = False, format_proxy_error(e)
+                    refused = error
                 if not success:
                     email_errors.append(f"{operation}: {error}")
 
