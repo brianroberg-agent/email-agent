@@ -152,16 +152,18 @@ class TestApprovalGateTimeoutFollowsProxyWindow:
         assert timeout.connect == 10.0
 
     @pytest.mark.parametrize("env_value,expected_read", [
-        (None, 330.0),
         ("900", 930.0),
         ("0", None),
     ])
     def test_env_var_reaches_the_module_constant(self, env_value, expected_read):
         """Import proxy_client in a fresh interpreter with the variable set
-        (or absent) and read back APPROVAL_GATE_TIMEOUT.read."""
-        env = {k: v for k, v in os.environ.items() if k != "PROXY_CONFIRMATION_TIMEOUT"}
-        if env_value is not None:
-            env["PROXY_CONFIRMATION_TIMEOUT"] = env_value
+        and read back APPROVAL_GATE_TIMEOUT.read. (The unset case is not
+        checked here: proxy_client runs load_dotenv() at import, so a
+        checkout's .env could set the variable and make an "unset" case
+        machine-dependent; the default is pinned by the pure-function test
+        above instead.)"""
+        env = dict(os.environ)
+        env["PROXY_CONFIRMATION_TIMEOUT"] = env_value
         code = (
             "import proxy_client; "
             "print(repr(proxy_client.APPROVAL_GATE_TIMEOUT.read))"
