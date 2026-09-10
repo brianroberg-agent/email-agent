@@ -21,8 +21,9 @@ PROXY_API_KEY = os.environ.get("PROXY_API_KEY", "")
 # Approval-gated proxy routes (trash/untrash in the proxy's default MODIFY
 # confirmation mode) hold the HTTP request open until a human decides, for up
 # to the proxy's confirmation window (api-proxy `--confirmation-timeout`,
-# default 300 s, 0 = wait forever; an expired window is answered with the
-# same 403 as a decline). The read timeout on those calls must outlast that
+# default 300 s, 0 = wait forever; api-proxy `main` answers an expired
+# window with the same 403 as a decline, api-proxy #9 with its own
+# `confirmation_expired` code). The read timeout on those calls must outlast that
 # window — otherwise a slow-but-approved decision surfaces here as a timeout
 # error while the trash still goes through on the proxy side. The window is
 # an operator setting on the proxy that this client cannot see, so it is
@@ -50,13 +51,17 @@ class ProxyAuthError(Exception):
 
 
 # The body the proxy's approval gate answers with when the operator declines
-# a request -- or when its approval window expires with no decision
-# (api-proxy gmail/handlers.py, handle_confirmation). This is the only 403
-# that is a human decision; the proxy also answers 403 for a disabled API
-# key (error "auth_error") and for a blocked or non-allowlisted path (error
+# a request (api-proxy gmail/handlers.py, handle_confirmation; identical on
+# api-proxy `main` and on #9's head). This is the only 403 that is a human
+# decision; the proxy also answers 403 for a disabled API key (error
+# "auth_error") and for a blocked or non-allowlisted path (error
 # "forbidden", message "This operation is not allowed").
 OPERATOR_DECLINE_CODE = "forbidden"
 OPERATOR_DECLINE_MESSAGE = "Request rejected by operator"
+# The gate's other answer: nobody decided within the approval window.
+# api-proxy #9 gives it this code; before #9 the proxy answers an expired
+# window with the decline body above, so it reads as a decline.
+GATE_EXPIRED_CODE = "confirmation_expired"
 
 
 class ProxyForbiddenError(Exception):
@@ -80,6 +85,14 @@ class ProxyForbiddenError(Exception):
             self.code == OPERATOR_DECLINE_CODE
             and str(self) == OPERATOR_DECLINE_MESSAGE
         )
+
+    @property
+    def is_gate_expiry(self) -> bool:
+        """True only for the gate's "nobody answered" 403 (GATE_EXPIRED_CODE,
+        api-proxy #9). Like a decline, it means no further approval prompt
+        should be raised without the operator being told; unlike a decline,
+        no human saw the request."""
+        return self.code == GATE_EXPIRED_CODE
 
 
 class ProxyError(Exception):

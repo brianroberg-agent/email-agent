@@ -127,6 +127,21 @@ class TestForbiddenErrorCarriesProxyErrorCode:
 
         assert ProxyForbiddenError(message, code=code).is_operator_decline is expected
 
+    @pytest.mark.parametrize("message,code,expected", [
+        ("Confirmation request expired before an operator responded", "confirmation_expired", True),
+        ("anything at all", "confirmation_expired", True),
+        ("Request rejected by operator", "forbidden", False),
+        ("API key is disabled", "auth_error", False),
+        ("Confirmation request expired before an operator responded", None, False),
+    ])
+    def test_is_gate_expiry_matches_only_the_expiry_code(self, message, code, expected):
+        """api-proxy #9 gives an unanswered approval window its own error
+        code. Only that code is an expiry; a proxy without #9 answers expiry
+        with the decline body, which is_operator_decline already covers."""
+        from proxy_client import ProxyForbiddenError
+
+        assert ProxyForbiddenError(message, code=code).is_gate_expiry is expected
+
 
 class TestApprovalGateTimeoutFollowsProxyWindow:
     """api-proxy's approval window is an operator flag (--confirmation-timeout,

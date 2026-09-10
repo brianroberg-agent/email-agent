@@ -292,6 +292,29 @@ class BulkOperation(str, Enum):
     # apply_label:LABEL_NAME is handled separately
 
 
+# The bulk operations that go through the proxy's approval gate in its
+# default (MODIFY) confirmation mode: one operator decision per message.
+# Once the gate answers one of these with a decline or an expired window,
+# the rest of them in the same request are not attempted (see bulk_actions).
+GATED_BULK_OPERATIONS = frozenset({BulkOperation.trash.value})
+
+
+def gate_answer_skip_reason(operation: str, e: ProxyForbiddenError) -> str | None:
+    """Pure: why the remaining gated operations of a bulk request are not
+    attempted after `operation` was refused with `e` -- or None when the
+    refusal is not the approval gate's answer (a disabled key, a blocked
+    path) and the request should carry on per operation as it does for
+    every other proxy error."""
+    if e.is_operator_decline:
+        return f"operator declined an earlier {operation} in this batch; re-issue if still wanted"
+    if e.is_gate_expiry:
+        return (
+            f"the approval window for an earlier {operation} in this batch expired "
+            "unanswered; re-issue if still wanted"
+        )
+    return None
+
+
 class EmailAction(BaseModel):
     """A single email with its operations to perform."""
     email_id: str = Field(..., description="Email ID to act on")
@@ -881,8 +904,8 @@ async def apply_single_operation(client, email_id: str, operation: str) -> tuple
             # Same gated proxy route as POST /trash — the proxy has no batch
             # approval, so a bulk trash is one operator decision per message
             # (each waiting up to APPROVAL_GATE_TIMEOUT). A proxy refusal
-            # propagates as ProxyForbiddenError so bulk_actions can stop the
-            # request there (see the loop in bulk_actions).
+            # propagates as ProxyForbiddenError so bulk_actions can tell the
+            # gate's answer from any other 403 (see the loop there).
             await client.trash_message(email_id)
         elif operation.startswith("apply_label:"):
             label_name = operation.split(":", 1)[1]
@@ -1224,37 +1247,40 @@ async def bulk_actions(request: BulkActionsRequest):
       approval per message; see POST /trash)
     - apply_label:LABEL_NAME: Add the specified label (TRASH/SPAM rejected)
 
-    The request stops at the first proxy refusal (a 403 -- an operator
-    decline, an expired approval window, a disabled key or a blocked path):
-    every operation after it is reported as "not attempted" and never sent.
-    The proxy answers a decline and an expired window with the same 403, so
-    continuing would queue one more prompt per remaining message for an
-    operator who may be absent, each waiting a full approval window. The
-    caller re-issues the not-attempted operations when it wants them.
+    Once the approval gate answers a gated operation (GATED_BULK_OPERATIONS,
+    i.e. trash) with an operator decline or an expired window, the remaining
+    gated operations in the request are reported as "not attempted" and
+    never sent: continuing would queue one more prompt per remaining message
+    for an operator who has just said no or is absent, each waiting a full
+    approval window. The ungated operations (mark_read, archive,
+    apply_label) still run -- a triage batch mixes both, and skipping them
+    would leave mail unread or in the inbox. Any other proxy error,
+    including a 403 for a disabled key or a blocked path (which fails fast
+    and queues no prompt), keeps the per-operation semantics: reported on
+    that operation, the rest attempted.
     """
     try:
         client = get_gmail_client()
         results = []
         success_count = 0
         error_count = 0
-        # Set to the first proxy refusal's text; once set, nothing else is sent.
-        refused: Optional[str] = None
+        # Set when the approval gate answers a gated operation (decline or
+        # expired window); the remaining gated operations are then skipped.
+        gate_skip: Optional[str] = None
 
         for action in request.actions:
             email_errors = []
 
             for operation in action.operations:
-                if refused is not None:
-                    email_errors.append(
-                        f"{operation}: not attempted — the proxy refused an earlier "
-                        f"operation in this request ({refused}); re-issue this one separately"
-                    )
+                if gate_skip is not None and operation in GATED_BULK_OPERATIONS:
+                    email_errors.append(f"{operation}: not attempted — {gate_skip}")
                     continue
                 try:
                     success, error = await apply_single_operation(client, action.email_id, operation)
                 except ProxyForbiddenError as e:
                     success, error = False, format_proxy_error(e)
-                    refused = error
+                    if operation in GATED_BULK_OPERATIONS:
+                        gate_skip = gate_answer_skip_reason(operation, e)
                 if not success:
                     email_errors.append(f"{operation}: {error}")
 
