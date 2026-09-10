@@ -20,14 +20,28 @@ PROXY_API_KEY = os.environ.get("PROXY_API_KEY", "")
 
 # Approval-gated proxy routes (trash/untrash in the proxy's default MODIFY
 # confirmation mode) hold the HTTP request open until a human decides, for up
-# to the proxy's confirmation window (api-proxy Config.confirmation_timeout,
-# default 300 s; an expired window is answered with the same 403 as a
-# decline). The read timeout on those calls must outlast that window —
-# otherwise a slow-but-approved decision surfaces here as a timeout error
-# while the trash still goes through on the proxy side. Connect stays short so
-# a dead proxy still fails fast. Applied per gated call only; every other call
-# keeps the 30 s default below.
-APPROVAL_GATE_TIMEOUT = httpx.Timeout(330.0, connect=10.0)
+# to the proxy's confirmation window (api-proxy `--confirmation-timeout`,
+# default 300 s, 0 = wait forever; an expired window is answered with the
+# same 403 as a decline). The read timeout on those calls must outlast that
+# window — otherwise a slow-but-approved decision surfaces here as a timeout
+# error while the trash still goes through on the proxy side. The window is
+# an operator setting on the proxy that this client cannot see, so it is
+# mirrored here: set PROXY_CONFIRMATION_TIMEOUT to the proxy's value.
+# Connect stays short so a dead proxy still fails fast. Applied per gated
+# call only; every other call keeps the 30 s default below.
+PROXY_CONFIRMATION_TIMEOUT = float(os.environ.get("PROXY_CONFIRMATION_TIMEOUT", "300"))
+APPROVAL_GATE_MARGIN_SECONDS = 30.0
+
+
+def approval_gate_timeout(window_seconds: float) -> httpx.Timeout:
+    """Pure: the httpx timeout for one approval-gated call, given the proxy's
+    confirmation window. 0 mirrors the proxy's own "no timeout" (read=None);
+    otherwise the read timeout outlasts the window by a margin."""
+    read = None if window_seconds <= 0 else window_seconds + APPROVAL_GATE_MARGIN_SECONDS
+    return httpx.Timeout(read, connect=10.0)
+
+
+APPROVAL_GATE_TIMEOUT = approval_gate_timeout(PROXY_CONFIRMATION_TIMEOUT)
 
 
 class ProxyAuthError(Exception):

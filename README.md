@@ -53,6 +53,7 @@ No separate install step needed. The `uv run` command automatically manages depe
 |----------|----------|---------|-------------|
 | `PROXY_API_KEY` | Yes | - | API key for proxy authentication (format: `aproxy_...`) |
 | `PROXY_URL` | No | `http://host.docker.internal:8000` | URL of the proxy server |
+| `PROXY_CONFIRMATION_TIMEOUT` | No | `300` | The proxy's approval window in seconds (its `--confirmation-timeout`; `0` = it waits forever). Must match the proxy: approval-gated calls (`/trash`, `/untrash`) wait this long plus 30 s for the operator's decision |
 | `MLX_URL` | No | `http://localhost:8080/v1/chat/completions` | Local LLM endpoint |
 | `MLX_MODEL` | No | `qwen/qwen3-14b` | Model name for LLM requests |
 | `LLM_MAX_TOKENS` | No | `4096` | Token budget per LLM completion (reasoning + answer) |
@@ -271,6 +272,7 @@ Move an email to Trash. This is the sanctioned, recoverable delete path — it c
 
 ```bash
 curl -X POST http://localhost:8081/trash \
+  --max-time 340 \
   -H "Content-Type: application/json" \
   -d '{"email_id": "18d5a3b2c4e5f6a7"}'
 ```
@@ -280,7 +282,7 @@ Response:
 {"success": true, "message": "Email moved to Trash", "error": null}
 ```
 
-The proxy holds the request open while the operator decides, so this call waits **up to 330 s** for the proxy's answer (`APPROVAL_GATE_TIMEOUT` in `proxy_client.py`, sized to outlast the proxy's default 300 s approval window) — much longer than the 30 s used for ungated calls. Give it that long on the calling side too: a client-side timeout shorter than the approval window reports failure for a trash that may then be approved and go through.
+The proxy holds the request open while the operator decides, so this call waits **up to 330 s by default** for the proxy's answer (`APPROVAL_GATE_TIMEOUT` in `proxy_client.py`: the proxy's approval window, `PROXY_CONFIRMATION_TIMEOUT`, default 300 s, plus 30 s) — much longer than the 30 s used for ungated calls. The window is an operator setting on the proxy (`--confirmation-timeout`) that this service cannot see; if the proxy runs with a different value, set `PROXY_CONFIRMATION_TIMEOUT` to match (`0` mirrors the proxy's "wait forever"), otherwise the wait here ends before the proxy's does. Give it that long on the calling side too — e.g. `curl --max-time 340` — because a client-side timeout shorter than the approval window reports failure for a trash that may then be approved and go through.
 
 If the operator declines the request at the approval gate — or the proxy's approval window expires with no decision; the proxy reports both the same way — the response is the documented error envelope (HTTP 200, `success: false`), not an HTTP error. Only the gate's own answer is mapped this way; a 403 for a disabled API key or a blocked path is still a 500 (see [Error Responses](#error-responses)):
 
@@ -294,6 +296,7 @@ Remove an email from Trash, restoring it to its prior labels.
 
 ```bash
 curl -X POST http://localhost:8081/untrash \
+  --max-time 340 \
   -H "Content-Type: application/json" \
   -d '{"email_id": "18d5a3b2c4e5f6a7"}'
 ```
@@ -303,7 +306,7 @@ Response:
 {"success": true, "message": "Email removed from Trash", "error": null}
 ```
 
-This route is approval-gated too: the same 330 s wait and the same `success: false` decline envelope as `POST /trash` apply.
+This route is approval-gated too: the same wait (`PROXY_CONFIRMATION_TIMEOUT` + 30 s, 330 s by default) and the same `success: false` decline envelope as `POST /trash` apply.
 
 ### POST /batch-summarize
 
@@ -381,7 +384,7 @@ Request body:
 Supported operations:
 - `mark_read` - Remove UNREAD label
 - `archive` - Remove INBOX label
-- `trash` - Move the email to Trash through the proxy's approval-gated trash route (the same path as `POST /trash`). The proxy has no batch approval, so a bulk trash is **one operator approval per message**, decided in sequence; each `trash` waits up to 330 s for its decision (see `POST /trash`). A refused message gets `"trash: Operation blocked: Request rejected by operator"` in its `error`, and **the request stops there**: every operation after the first proxy refusal is reported as `"<op>: not attempted — the proxy refused an earlier operation in this request (...)"` and is never sent. The proxy answers an operator decline and an expired approval window with the same 403, so continuing would queue one more prompt per remaining message for an operator who may have stepped away, each waiting a full approval window; re-issue the not-attempted operations when you want them. Applying `TRASH` as a label is not an alternative — see below.
+- `trash` - Move the email to Trash through the proxy's approval-gated trash route (the same path as `POST /trash`). The proxy has no batch approval, so a bulk trash is **one operator approval per message**, decided in sequence; each `trash` waits up to 330 s by default for its decision (see `POST /trash`). A refused message gets `"trash: Operation blocked: Request rejected by operator"` in its `error`, and **the request stops there**: every operation after the first proxy refusal is reported as `"<op>: not attempted — the proxy refused an earlier operation in this request (...)"` and is never sent. The proxy answers an operator decline and an expired approval window with the same 403, so continuing would queue one more prompt per remaining message for an operator who may have stepped away, each waiting a full approval window; re-issue the not-attempted operations when you want them. Applying `TRASH` as a label is not an alternative — see below.
 
   The per-message results are returned only when the whole request finishes, so a client-side timeout shorter than the request discards the outcomes of trashes the operator already approved (they are in Trash; the response never arrives). Size the client timeout for the number of approvals in the request, or send one `POST /trash` per message when that is not practical.
 - `apply_label:LABEL_NAME` - Add the specified label (e.g., `apply_label:IMPORTANT`); `TRASH`/`SPAM` are rejected (see `POST /apply-label`)
