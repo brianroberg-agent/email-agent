@@ -356,3 +356,46 @@ class TestMisconfigurationWithoutStartup:
         monkeypatch.setenv("EMAIL_AGENT_API_KEYS", "")
 
         assert anonymous_client.get("/health").status_code == 200
+
+
+class TestOpenApiDeclaresTheScheme:
+    @pytest.fixture
+    def schema(self, client):
+        response = client.get("/openapi.json")
+        assert response.status_code == 200
+        return response.json()
+
+    def test_the_document_declares_an_http_bearer_scheme(self, schema):
+        schemes = schema["components"]["securitySchemes"]
+
+        assert schemes == {"bearerAuth": {"type": "http", "scheme": "bearer"}}
+
+    def test_the_scheme_is_required_for_the_whole_api(self, schema):
+        assert schema["security"] == [{"bearerAuth": []}]
+
+    def test_only_the_open_operations_are_marked_as_needing_no_token(self, schema):
+        """An operation needs the document-wide scheme unless it carries its
+        own empty `security` list; the ones that do must be exactly the
+        operations that answer without a token."""
+        marked_open = {
+            (method.upper(), path)
+            for path, operations in schema["paths"].items()
+            for method, operation in operations.items()
+            if operation.get("security") == []
+        }
+        overrides = [
+            operation["security"]
+            for operations in schema["paths"].values()
+            for operation in operations.values()
+            if "security" in operation
+        ]
+
+        assert marked_open == OPEN_OPERATIONS
+        assert overrides == [[]]
+
+    def test_the_existing_schemas_are_still_in_the_document(self, schema):
+        assert "SearchRequest" in schema["components"]["schemas"]
+        assert "/search" in schema["paths"]
+
+    def test_the_document_is_the_same_on_a_second_request(self, client, schema):
+        assert client.get("/openapi.json").json() == schema

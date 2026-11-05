@@ -327,3 +327,19 @@ class BearerAuthMiddleware:
             }
         )
         await send({"type": "http.response.body", "body": body})
+
+
+def declare_bearer_scheme(schema: dict, exempt_paths: Iterable[str]) -> dict:
+    """Add the bearer scheme to an OpenAPI document, in place: required for
+    the whole API, with an empty requirement on the exempt paths' operations.
+    Applying it twice gives the same document."""
+    components = schema.setdefault("components", {})
+    components.setdefault("securitySchemes", {})["bearerAuth"] = {
+        "type": "http",
+        "scheme": "bearer",
+    }
+    schema["security"] = [{"bearerAuth": []}]
+    for path in exempt_paths:
+        for operation in schema.get("paths", {}).get(path, {}).values():
+            operation["security"] = []
+    return schema

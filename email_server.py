@@ -31,6 +31,7 @@ from auth import (
     AuthSettings,
     BearerAuthMiddleware,
     StderrLogging,
+    declare_bearer_scheme,
     load_auth_settings,
     logger as auth_logger,
     startup_messages,
@@ -164,6 +165,17 @@ app.add_middleware(
     get_settings=_auth_settings,
     exempt_paths=AUTH_EXEMPT_PATHS,
 )
+
+_fastapi_openapi = app.openapi
+
+
+def _openapi_with_bearer_scheme() -> dict:
+    """The generated OpenAPI document, declaring the bearer scheme so a
+    client can see that a token is needed."""
+    return declare_bearer_scheme(_fastapi_openapi(), AUTH_EXEMPT_PATHS)
+
+
+app.openapi = _openapi_with_bearer_scheme  # type: ignore[method-assign]
 
 
 class LLMError(Exception):
