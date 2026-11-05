@@ -1,0 +1,336 @@
+"""What the service does about authentication when it starts.
+
+The in-process tests run the application's start-up hook through
+TestClient's context manager. The subprocess tests run the documented start
+command (`uvicorn email_server:app`) on a loopback port, with the upstream
+URLs pointed at a closed loopback port; no upstream is contacted.
+"""
+
+import logging
+import os
+import socket
+import subprocess
+import sys
+import time
+from contextlib import contextmanager
+from pathlib import Path
+
+import httpx
+import pytest
+from fastapi.testclient import TestClient
+
+import auth
+from email_server import app
+from tests.conftest import TEST_API_TOKEN, TEST_CALLER, WRONG_API_TOKEN
+
+AUTH_LOGGER = "email_agent.auth"
+BEARER = {"Authorization": f"Bearer {TEST_API_TOKEN}"}
+SECOND_TOKEN = "synthetic-second-token-22222222222222"
+REPO_ROOT = Path(__file__).resolve().parents[1]
+
+
+def auth_messages(caplog, level):
+    return [
+        record.getMessage()
+        for record in caplog.records
+        if record.name == AUTH_LOGGER and record.levelno == level
+    ]
+
+
+@pytest.fixture
+def auth_log(caplog):
+    caplog.set_level(logging.INFO, logger=AUTH_LOGGER)
+    return caplog
+
+
+class TestStartupRefusal:
+    @pytest.mark.parametrize(
+        "mode, keys",
+        [
+            ("required", ""),
+            ("", ""),
+            ("required", "tests:too-short"),
+            ("optional", f"tests:{TEST_API_TOKEN},tests:{SECOND_TOKEN}"),
+            ("sometimes", f"tests:{TEST_API_TOKEN}"),
+        ],
+        ids=[
+            "required with no tokens",
+            "default mode with no tokens",
+            "a token that is too short",
+            "a duplicate name",
+            "an unknown mode",
+        ],
+    )
+    def test_a_bad_configuration_stops_start_up(self, mode, keys, monkeypatch, capsys):
+        monkeypatch.setenv("EMAIL_AGENT_AUTH", mode)
+        monkeypatch.setenv("EMAIL_AGENT_API_KEYS", keys)
+
+        with pytest.raises(auth.AuthConfigError):
+            with TestClient(app):
+                pytest.fail("the application started")
+
+        stderr = capsys.readouterr().err
+        assert "email-agent: ERROR refusing to start" in stderr
+        assert TEST_API_TOKEN not in stderr and SECOND_TOKEN not in stderr
+
+    def test_required_mode_with_no_tokens_names_both_settings(self, monkeypatch, capsys):
+        monkeypatch.setenv("EMAIL_AGENT_API_KEYS", "")
+
+        with pytest.raises(auth.AuthConfigError):
+            with TestClient(app):
+                pytest.fail("the application started")
+
+        stderr = capsys.readouterr().err
+        assert "EMAIL_AGENT_API_KEYS" in stderr
+        assert "EMAIL_AGENT_AUTH" in stderr
+
+
+class TestStartupMessages:
+    def test_off_mode_warns_that_nothing_is_authenticated(self, monkeypatch, auth_log, capsys):
+        monkeypatch.setenv("EMAIL_AGENT_AUTH", "off")
+
+        with TestClient(app):
+            pass
+
+        (warning,) = auth_messages(auth_log, logging.WARNING)
+        assert "EMAIL_AGENT_AUTH=off" in warning
+        assert "without authentication" in warning
+        assert "email-agent: WARNING auth: EMAIL_AGENT_AUTH=off" in capsys.readouterr().err
+
+    def test_optional_mode_warns_that_tokenless_requests_are_served(
+        self, monkeypatch, auth_log
+    ):
+        monkeypatch.setenv("EMAIL_AGENT_AUTH", "optional")
+
+        with TestClient(app):
+            pass
+
+        (warning,) = auth_messages(auth_log, logging.WARNING)
+        assert "EMAIL_AGENT_AUTH=optional" in warning
+        assert "without a token are served" in warning
+        assert TEST_CALLER in warning
+
+    def test_optional_mode_with_no_tokens_says_so(self, monkeypatch, auth_log):
+        monkeypatch.setenv("EMAIL_AGENT_AUTH", "optional")
+        monkeypatch.setenv("EMAIL_AGENT_API_KEYS", "")
+
+        with TestClient(app):
+            pass
+
+        (warning,) = auth_messages(auth_log, logging.WARNING)
+        assert "no tokens are configured" in warning
+
+    def test_required_mode_lists_the_caller_names_without_a_warning(
+        self, monkeypatch, auth_log, capsys
+    ):
+        monkeypatch.setenv(
+            "EMAIL_AGENT_API_KEYS", f"{TEST_CALLER}:{TEST_API_TOKEN},second:{SECOND_TOKEN}"
+        )
+
+        with TestClient(app):
+            pass
+
+        assert auth_messages(auth_log, logging.WARNING) == []
+        (info,) = auth_messages(auth_log, logging.INFO)
+        assert "EMAIL_AGENT_AUTH=required" in info
+        assert f"{TEST_CALLER}, second" in info
+        assert "email-agent: INFO auth: EMAIL_AGENT_AUTH=required" in capsys.readouterr().err
+
+    @pytest.mark.parametrize("mode", ["required", "optional", "off"])
+    def test_start_up_output_holds_no_token(self, mode, monkeypatch, caplog, capsys):
+        caplog.set_level(logging.DEBUG)
+        monkeypatch.setenv("EMAIL_AGENT_AUTH", mode)
+        monkeypatch.setenv(
+            "EMAIL_AGENT_API_KEYS", f"{TEST_CALLER}:{TEST_API_TOKEN},second:{SECOND_TOKEN}"
+        )
+
+        with TestClient(app):
+            pass
+
+        console = capsys.readouterr()
+        assert auth_messages(caplog, logging.INFO) + auth_messages(caplog, logging.WARNING)
+        for text in (caplog.text, console.out, console.err):
+            assert TEST_API_TOKEN not in text
+            assert SECOND_TOKEN not in text
+
+
+class TestSettingsAreReadAtStartup:
+    def test_a_later_change_to_the_environment_does_not_change_the_running_service(
+        self, monkeypatch
+    ):
+        with TestClient(app) as client:
+            monkeypatch.setenv("EMAIL_AGENT_AUTH", "off")
+            monkeypatch.setenv("EMAIL_AGENT_API_KEYS", "")
+
+            assert client.get("/openapi.json").status_code == 401
+            assert client.get("/openapi.json", headers=BEARER).status_code == 200
+
+    def test_the_next_start_reads_the_environment_again(self, monkeypatch):
+        with TestClient(app) as client:
+            assert client.get("/openapi.json").status_code == 401
+
+        monkeypatch.setenv("EMAIL_AGENT_AUTH", "off")
+        with TestClient(app) as client:
+            assert client.get("/openapi.json").status_code == 200
+
+
+class TestRequestLogReachesStderr:
+    def test_request_lines_are_written_to_stderr_while_the_service_runs(self, capsys):
+        with TestClient(app) as client:
+            client.get("/openapi.json", headers=BEARER)
+            client.get("/openapi.json")
+
+        stderr = capsys.readouterr().err
+        assert (
+            f"email-agent: INFO auth: GET /openapi.json from testclient authenticated as '{TEST_CALLER}'"
+            in stderr
+        )
+        assert "email-agent: WARNING auth: refused GET /openapi.json from testclient (no token)" in stderr
+
+    def test_the_stderr_handler_is_removed_at_shutdown(self):
+        logger = logging.getLogger(AUTH_LOGGER)
+        before = (list(logger.handlers), logger.level)
+
+        with TestClient(app):
+            assert len(logger.handlers) == len(before[0]) + 1
+
+        assert (list(logger.handlers), logger.level) == before
+
+    def test_a_handler_the_operator_attached_is_left_alone(self):
+        logger = logging.getLogger(AUTH_LOGGER)
+        own = logging.NullHandler()
+        logger.addHandler(own)
+        try:
+            with TestClient(app):
+                assert logger.handlers == [own]
+            assert logger.handlers == [own]
+        finally:
+            logger.removeHandler(own)
+
+
+def _free_loopback_port() -> int:
+    with socket.socket() as probe:
+        probe.bind(("127.0.0.1", 0))
+        return probe.getsockname()[1]
+
+
+def _server_command(port: int) -> list[str]:
+    return [
+        sys.executable, "-m", "uvicorn", "email_server:app",
+        "--host", "127.0.0.1", "--port", str(port),
+    ]
+
+
+def _server_env(**settings: str) -> dict[str, str]:
+    """The current environment with both upstream URLs pointed at a closed
+    loopback port and the auth settings replaced."""
+    closed = "http://127.0.0.1:9"
+    return {
+        **os.environ,
+        "PROXY_URL": closed,
+        "MLX_URL": f"{closed}/v1/chat/completions",
+        "PROXY_API_KEY": "aproxy_" + "0" * 32,
+        **settings,
+    }
+
+
+@contextmanager
+def running_server(**settings: str):
+    """Start the service with the documented command on a loopback port,
+    yield an httpx client for it, then stop it. The yielded dict gains the
+    process's stderr under "stderr" once the block exits."""
+    port = _free_loopback_port()
+    process = subprocess.Popen(
+        _server_command(port),
+        cwd=REPO_ROOT,
+        env=_server_env(**settings),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    result: dict = {}
+    try:
+        with httpx.Client(base_url=f"http://127.0.0.1:{port}", trust_env=False, timeout=5) as client:
+            deadline = time.monotonic() + 30
+            while True:
+                if process.poll() is not None:
+                    pytest.fail(f"the server exited during start-up:\n{process.stderr.read()}")
+                try:
+                    if client.get("/health").status_code == 200:
+                        break
+                except httpx.TransportError:
+                    pass
+                if time.monotonic() > deadline:
+                    pytest.fail("the server did not answer /health within 30 s")
+                time.sleep(0.1)
+            result["client"] = client
+            yield result
+    finally:
+        process.terminate()
+        try:
+            _, result["stderr"] = process.communicate(timeout=15)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            _, result["stderr"] = process.communicate()
+
+
+class TestServerProcess:
+    def test_the_server_exits_at_start_up_in_required_mode_with_no_tokens(self):
+        completed = subprocess.run(
+            _server_command(_free_loopback_port()),
+            cwd=REPO_ROOT,
+            env=_server_env(EMAIL_AGENT_AUTH="", EMAIL_AGENT_API_KEYS=""),
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+
+        assert completed.returncode != 0
+        assert "email-agent: ERROR refusing to start" in completed.stderr
+        assert "EMAIL_AGENT_API_KEYS" in completed.stderr
+        assert "EMAIL_AGENT_AUTH" in completed.stderr
+        assert "Uvicorn running" not in completed.stderr
+
+    def test_a_running_server_in_optional_mode_serves_logs_and_refuses(self):
+        with running_server(
+            EMAIL_AGENT_AUTH="optional",
+            EMAIL_AGENT_API_KEYS=f"{TEST_CALLER}:{TEST_API_TOKEN}",
+        ) as server:
+            client = server["client"]
+            tokenless = client.get("/openapi.json")
+            authenticated = client.get("/openapi.json", headers=BEARER)
+            wrong = client.get(
+                "/openapi.json", headers={"Authorization": f"Bearer {WRONG_API_TOKEN}"}
+            )
+
+        assert tokenless.status_code == 200
+        assert authenticated.status_code == 200
+        assert wrong.status_code == 401
+        assert wrong.headers["www-authenticate"] == "Bearer"
+        assert wrong.json() == {"detail": "Missing or invalid bearer token"}
+        stderr = server["stderr"]
+        assert "email-agent: WARNING auth: EMAIL_AGENT_AUTH=optional" in stderr
+        assert (
+            "email-agent: WARNING auth: unauthenticated request served (optional mode): "
+            "GET /openapi.json from 127.0.0.1" in stderr
+        )
+        assert (
+            f"email-agent: INFO auth: GET /openapi.json from 127.0.0.1 authenticated as '{TEST_CALLER}'"
+            in stderr
+        )
+        assert "email-agent: WARNING auth: refused GET /openapi.json from 127.0.0.1 (invalid token)" in stderr
+        assert TEST_API_TOKEN not in stderr
+        assert WRONG_API_TOKEN not in stderr
+
+    def test_a_running_server_in_required_mode_refuses_a_tokenless_request(self):
+        with running_server(
+            EMAIL_AGENT_AUTH="required",
+            EMAIL_AGENT_API_KEYS=f"{TEST_CALLER}:{TEST_API_TOKEN}",
+        ) as server:
+            client = server["client"]
+            tokenless = client.get("/openapi.json")
+            authenticated = client.get("/openapi.json", headers=BEARER)
+
+        assert tokenless.status_code == 401
+        assert authenticated.status_code == 200
+        assert "refused GET /openapi.json from 127.0.0.1 (no token)" in server["stderr"]

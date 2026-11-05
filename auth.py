@@ -77,6 +77,73 @@ def load_auth_settings(environ: Mapping[str, str]) -> AuthSettings:
     return AuthSettings(mode=mode, keys=keys)
 
 
+def startup_messages(settings: AuthSettings) -> list[tuple[int, str]]:
+    """The (level, message) lines to log when the service starts. They name
+    the mode and the callers; they hold no token."""
+    callers = ", ".join(key.name for key in settings.keys)
+    if settings.mode is AuthMode.OFF:
+        return [
+            (
+                logging.WARNING,
+                f"auth: {MODE_ENV}=off: every request is served without "
+                "authentication",
+            )
+        ]
+    if settings.mode is AuthMode.OPTIONAL:
+        configured = (
+            f"tokens are configured for: {callers}"
+            if callers
+            else "no tokens are configured, so every request that carries a "
+            "token is refused"
+        )
+        return [
+            (
+                logging.WARNING,
+                f"auth: {MODE_ENV}=optional: requests without a token are served "
+                f"and logged; {configured}",
+            )
+        ]
+    return [
+        (
+            logging.INFO,
+            f"auth: {MODE_ENV}=required: every route except the health check "
+            f"needs a bearer token; tokens are configured for: {callers}",
+        )
+    ]
+
+
+class StderrLogging:
+    """Writes the auth logger's lines to stderr while the service runs.
+
+    install() adds a stderr handler (and INFO level) to the auth logger
+    unless the logger already has a handler of its own, in which case the
+    operator's logging setup is left as it is. remove() undoes install().
+    """
+
+    FORMAT = "email-agent: %(levelname)s %(message)s"
+
+    def __init__(self) -> None:
+        self._handler: Optional[logging.Handler] = None
+        self._previous_level = logging.NOTSET
+
+    def install(self) -> None:
+        if logger.handlers:
+            return
+        self._handler = logging.StreamHandler()
+        self._handler.setFormatter(logging.Formatter(self.FORMAT))
+        self._previous_level = logger.level
+        logger.addHandler(self._handler)
+        if logger.level == logging.NOTSET:
+            logger.setLevel(logging.INFO)
+
+    def remove(self) -> None:
+        if self._handler is None:
+            return
+        logger.removeHandler(self._handler)
+        logger.setLevel(self._previous_level)
+        self._handler = None
+
+
 @dataclass(frozen=True)
 class Decision:
     """What to do with one request.

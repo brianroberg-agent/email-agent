@@ -26,7 +26,15 @@ import httpx
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 
-from auth import AuthSettings, BearerAuthMiddleware, load_auth_settings
+from auth import (
+    AuthConfigError,
+    AuthSettings,
+    BearerAuthMiddleware,
+    StderrLogging,
+    load_auth_settings,
+    logger as auth_logger,
+    startup_messages,
+)
 from gmail_utils import (
     get_header,
     normalize_header_text,
@@ -92,6 +100,28 @@ def strip_think_tags(text: str) -> str:
 
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
+    # Read the authentication settings once, here, so a bad configuration
+    # stops the service before it accepts a request. Nothing below runs, and
+    # the server never binds its port, if this raises.
+    try:
+        auth_settings = load_auth_settings(os.environ)
+    except AuthConfigError as e:
+        print(f"email-agent: ERROR refusing to start: {e}", file=sys.stderr, flush=True)
+        raise
+    auth_logging = StderrLogging()
+    auth_logging.install()
+    for level, message in startup_messages(auth_settings):
+        auth_logger.log(level, message)
+    _app.state.auth_settings = auth_settings
+    try:
+        _print_llm_banner()
+        yield
+    finally:
+        _app.state.auth_settings = None
+        auth_logging.remove()
+
+
+def _print_llm_banner() -> None:
     # Log the LLM configuration once, when the server actually starts —
     # not on every import of this module.
     print(
@@ -109,7 +139,6 @@ async def lifespan(_app: FastAPI):
             file=sys.stderr,
             flush=True,
         )
-    yield
 
 
 app = FastAPI(title="Email Agent Server v2", version="2.0", lifespan=lifespan)
@@ -122,9 +151,12 @@ AUTH_EXEMPT_PATHS = frozenset({"/health"})
 
 
 def _auth_settings() -> AuthSettings:
-    """The settings the token check uses for a request, read from the
-    environment."""
-    return load_auth_settings(os.environ)
+    """The settings the token check uses for a request: the ones the
+    start-up hook loaded. If the application is being driven without its
+    start-up hook, they are read from the environment for each request, so a
+    bad configuration raises here instead of the request being served."""
+    loaded = getattr(app.state, "auth_settings", None)
+    return loaded if loaded is not None else load_auth_settings(os.environ)
 
 
 app.add_middleware(

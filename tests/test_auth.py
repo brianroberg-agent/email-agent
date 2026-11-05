@@ -67,6 +67,7 @@ MALFORMED_KEYS = {
     "name with a space": (f"al pha:{TOKEN_A}", "entry 1"),
     "name with a control character": (f"al\x1bpha:{TOKEN_A}", "entry 1"),
     "name as long as a token": (f"{TOKEN_B}:{TOKEN_A}", "entry 1"),
+    "name of 32 characters": (f"{'n' * 32}:{TOKEN_A}", "entry 1"),
     "second entry malformed": (f"alpha:{TOKEN_A},beta", "entry 2"),
 }
 
