@@ -117,3 +117,198 @@ class TestParseApiKeysRejectsMalformedSettings:
         assert "alpha" in repr(key)
         assert TOKEN_A not in repr(key)
         assert "digest" not in repr(key)
+
+
+class TestLoadAuthSettings:
+    def test_mode_defaults_to_required(self):
+        settings = auth.load_auth_settings({"EMAIL_AGENT_API_KEYS": f"alpha:{TOKEN_A}"})
+
+        assert settings.mode is auth.AuthMode.REQUIRED
+        assert [key.name for key in settings.keys] == ["alpha"]
+
+    def test_a_blank_mode_is_treated_as_unset(self):
+        settings = auth.load_auth_settings(
+            {"EMAIL_AGENT_AUTH": "  ", "EMAIL_AGENT_API_KEYS": f"alpha:{TOKEN_A}"}
+        )
+
+        assert settings.mode is auth.AuthMode.REQUIRED
+
+    @pytest.mark.parametrize(
+        "value, expected",
+        [
+            ("required", "REQUIRED"),
+            ("optional", "OPTIONAL"),
+            ("off", "OFF"),
+            ("Optional", "OPTIONAL"),
+            (" OFF ", "OFF"),
+        ],
+    )
+    def test_each_mode_value_is_recognised(self, value, expected):
+        settings = auth.load_auth_settings(
+            {"EMAIL_AGENT_AUTH": value, "EMAIL_AGENT_API_KEYS": f"alpha:{TOKEN_A}"}
+        )
+
+        assert settings.mode is auth.AuthMode[expected]
+
+    def test_an_unknown_mode_is_a_configuration_error_that_does_not_echo_it(self):
+        with pytest.raises(auth.AuthConfigError) as excinfo:
+            auth.load_auth_settings(
+                {"EMAIL_AGENT_AUTH": TOKEN_B, "EMAIL_AGENT_API_KEYS": f"alpha:{TOKEN_A}"}
+            )
+
+        message = str(excinfo.value)
+        assert "EMAIL_AGENT_AUTH" in message
+        for mode in ("required", "optional", "off"):
+            assert mode in message
+        assert TOKEN_B not in message
+
+    @pytest.mark.parametrize(
+        "environ",
+        [
+            {},
+            {"EMAIL_AGENT_AUTH": "required"},
+            {"EMAIL_AGENT_AUTH": "required", "EMAIL_AGENT_API_KEYS": ""},
+            {"EMAIL_AGENT_API_KEYS": " , "},
+        ],
+    )
+    def test_required_mode_without_tokens_is_refused_naming_both_settings(self, environ):
+        with pytest.raises(auth.AuthConfigError) as excinfo:
+            auth.load_auth_settings(environ)
+
+        message = str(excinfo.value)
+        assert "EMAIL_AGENT_API_KEYS" in message
+        assert "EMAIL_AGENT_AUTH" in message
+
+    @pytest.mark.parametrize("mode", ["optional", "off"])
+    def test_optional_and_off_load_without_tokens(self, mode):
+        settings = auth.load_auth_settings({"EMAIL_AGENT_AUTH": mode})
+
+        assert settings.mode is auth.AuthMode(mode)
+        assert settings.keys == ()
+
+    @pytest.mark.parametrize("mode", ["required", "optional", "off"])
+    def test_a_malformed_key_list_is_refused_in_every_mode(self, mode):
+        with pytest.raises(auth.AuthConfigError) as excinfo:
+            auth.load_auth_settings(
+                {"EMAIL_AGENT_AUTH": mode, "EMAIL_AGENT_API_KEYS": "alpha:too-short"}
+            )
+
+        assert "entry 1" in str(excinfo.value)
+
+    def test_settings_repr_holds_no_token(self):
+        settings = auth.load_auth_settings(
+            {"EMAIL_AGENT_API_KEYS": f"alpha:{TOKEN_A},beta:{TOKEN_B}"}
+        )
+
+        assert TOKEN_A not in repr(settings)
+        assert TOKEN_B not in repr(settings)
+
+
+def _settings(mode: str, keys: str = f"alpha:{TOKEN_A},beta:{TOKEN_B}") -> "auth.AuthSettings":
+    return auth.load_auth_settings({"EMAIL_AGENT_AUTH": mode, "EMAIL_AGENT_API_KEYS": keys})
+
+
+# Authorization header values that are present but are not a configured
+# bearer token. Each must be refused wherever a token is checked.
+WRONG_CREDENTIALS = {
+    "an unknown token": [f"Bearer {TOKEN_C}"],
+    "a configured token cut short": [f"Bearer {TOKEN_A[:-1]}"],
+    "a configured token with a suffix": [f"Bearer {TOKEN_A}x"],
+    "a configured token in different case": [f"Bearer {TOKEN_A.upper()}"],
+    "the token with no scheme": [TOKEN_A],
+    "another scheme": [f"Basic {TOKEN_A}"],
+    "the scheme with no token": ["Bearer"],
+    "the scheme and a space": ["Bearer "],
+    "an empty header": [""],
+    "a third word after the token": [f"Bearer {TOKEN_A} extra"],
+    "a caller name instead of a token": ["Bearer alpha"],
+    "two headers, both valid": [f"Bearer {TOKEN_A}", f"Bearer {TOKEN_B}"],
+}
+
+
+class TestDecide:
+    @pytest.mark.parametrize("name, token", [("alpha", TOKEN_A), ("beta", TOKEN_B)])
+    @pytest.mark.parametrize("mode", ["required", "optional"])
+    def test_a_configured_token_is_allowed_and_names_its_caller(self, mode, name, token):
+        decision = auth.decide(_settings(mode), [f"Bearer {token}"])
+
+        assert decision.allowed is True
+        assert decision.caller == name
+        assert decision.credential == "valid"
+
+    @pytest.mark.parametrize("header", [f"bearer {TOKEN_A}", f"BEARER {TOKEN_A}", f"Bearer   {TOKEN_A}  "])
+    def test_scheme_case_and_extra_spaces_do_not_matter(self, header):
+        decision = auth.decide(_settings("required"), [header])
+
+        assert decision.allowed is True
+        assert decision.caller == "alpha"
+
+    def test_required_mode_refuses_a_request_with_no_header(self):
+        decision = auth.decide(_settings("required"), [])
+
+        assert decision.allowed is False
+        assert decision.caller is None
+        assert decision.credential == "none"
+
+    def test_optional_mode_allows_a_request_with_no_header_without_a_caller(self):
+        decision = auth.decide(_settings("optional"), [])
+
+        assert decision.allowed is True
+        assert decision.caller is None
+        assert decision.credential == "none"
+
+    @pytest.mark.parametrize("case", sorted(WRONG_CREDENTIALS))
+    @pytest.mark.parametrize("mode", ["required", "optional"])
+    def test_a_wrong_credential_is_refused(self, mode, case):
+        decision = auth.decide(_settings(mode), WRONG_CREDENTIALS[case])
+
+        assert decision.allowed is False
+        assert decision.caller is None
+        assert decision.credential == "invalid"
+
+    def test_optional_mode_with_no_keys_refuses_any_token(self):
+        decision = auth.decide(_settings("optional", keys=""), [f"Bearer {TOKEN_A}"])
+
+        assert decision.allowed is False
+        assert decision.credential == "invalid"
+
+    @pytest.mark.parametrize(
+        "headers", [[], [f"Bearer {TOKEN_A}"], [f"Bearer {TOKEN_C}"], ["Basic nonsense"]]
+    )
+    def test_off_mode_allows_everything_and_checks_nothing(self, headers, monkeypatch):
+        def fail(*args):
+            raise AssertionError("off mode compared a token")
+
+        settings = _settings("off")
+        monkeypatch.setattr(auth.hmac, "compare_digest", fail)
+
+        decision = auth.decide(settings, headers)
+
+        assert decision.allowed is True
+        assert decision.caller is None
+        assert decision.credential == "unchecked"
+
+    @pytest.mark.parametrize("presented", [TOKEN_A, TOKEN_B, TOKEN_C])
+    def test_every_key_is_compared_in_constant_time_with_no_early_exit(
+        self, presented, monkeypatch
+    ):
+        """The comparison is hmac.compare_digest, on equal-length digests,
+        once per configured key whichever one matches (or none)."""
+        import hmac as real_hmac
+
+        real_compare = real_hmac.compare_digest
+        calls = []
+
+        def spy(a, b):
+            calls.append((a, b))
+            return real_compare(a, b)
+
+        settings = _settings("required", keys=f"alpha:{TOKEN_A},beta:{TOKEN_B},gamma:{'g' * 40}")
+        monkeypatch.setattr(auth.hmac, "compare_digest", spy)
+
+        auth.decide(settings, [f"Bearer {presented}"])
+
+        assert len(calls) == 3
+        for a, b in calls:
+            assert isinstance(a, bytes) and isinstance(b, bytes)
+            assert len(a) == len(b) == 32

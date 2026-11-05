@@ -4,10 +4,12 @@ import hashlib
 import hmac
 import re
 from dataclasses import dataclass, field
-from typing import Optional
+from enum import Enum
+from typing import Mapping, Optional, Sequence
 
 
 KEYS_ENV = "EMAIL_AGENT_API_KEYS"
+MODE_ENV = "EMAIL_AGENT_AUTH"
 
 MIN_TOKEN_LENGTH = 32
 # A name must be shorter than the shortest token, so a token pasted in the
@@ -35,6 +37,90 @@ class ApiKey:
 
     def matches(self, presented: str) -> bool:
         return hmac.compare_digest(self.digest, _digest(presented))
+
+
+class AuthMode(str, Enum):
+    REQUIRED = "required"
+    OPTIONAL = "optional"
+    OFF = "off"
+
+
+@dataclass(frozen=True)
+class AuthSettings:
+    mode: AuthMode
+    keys: tuple[ApiKey, ...]
+
+
+def load_auth_settings(environ: Mapping[str, str]) -> AuthSettings:
+    """Read the mode and the keys from `environ`.
+
+    Raises AuthConfigError for an unknown mode, a malformed key list (in any
+    mode), or `required` mode with no keys.
+    """
+    raw_mode = (environ.get(MODE_ENV) or "").strip().lower()
+    allowed = ", ".join(mode.value for mode in AuthMode)
+    try:
+        mode = AuthMode(raw_mode) if raw_mode else AuthMode.REQUIRED
+    except ValueError:
+        raise AuthConfigError(f"{MODE_ENV} must be one of: {allowed}") from None
+    keys = parse_api_keys(environ.get(KEYS_ENV))
+    if mode is AuthMode.REQUIRED and not keys:
+        raise AuthConfigError(
+            f"{MODE_ENV} is 'required' (the default) and {KEYS_ENV} holds no "
+            f"tokens. Set {KEYS_ENV} to comma-separated name:token pairs, or "
+            f"set {MODE_ENV} to 'optional' or 'off'."
+        )
+    return AuthSettings(mode=mode, keys=keys)
+
+
+@dataclass(frozen=True)
+class Decision:
+    """What to do with one request.
+
+    credential is "valid", "invalid", "none" (no Authorization header) or
+    "unchecked" (mode off). caller is the matching key's name, if any.
+    """
+
+    allowed: bool
+    caller: Optional[str]
+    credential: str
+
+
+def decide(settings: AuthSettings, authorization: Sequence[str]) -> Decision:
+    """Decide a request from its Authorization header values.
+
+    Only the absence of the header counts as "no token". A header that is
+    present but is not exactly one `Bearer <configured token>` is invalid.
+    """
+    if settings.mode is AuthMode.OFF:
+        return Decision(allowed=True, caller=None, credential="unchecked")
+    if not authorization:
+        return Decision(
+            allowed=settings.mode is AuthMode.OPTIONAL, caller=None, credential="none"
+        )
+    caller = None
+    if len(authorization) == 1:
+        parts = authorization[0].split()
+        if len(parts) == 2 and parts[0].lower() == "bearer":
+            caller = match_token(parts[1], settings.keys)
+    if caller is None:
+        return Decision(allowed=False, caller=None, credential="invalid")
+    return Decision(allowed=True, caller=caller, credential="valid")
+
+
+def match_token(presented: str, keys: Sequence[ApiKey]) -> Optional[str]:
+    """Return the name of the key `presented` matches, or None.
+
+    Compares SHA-256 digests with hmac.compare_digest and visits every key,
+    so the time taken does not depend on which key matched or on how much of
+    a token was right.
+    """
+    presented_digest = _digest(presented)
+    caller = None
+    for key in keys:
+        if hmac.compare_digest(key.digest, presented_digest):
+            caller = key.name
+    return caller
 
 
 def parse_api_keys(raw: Optional[str]) -> tuple[ApiKey, ...]:
