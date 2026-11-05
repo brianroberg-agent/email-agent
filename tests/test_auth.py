@@ -312,3 +312,63 @@ class TestDecide:
         for a, b in calls:
             assert isinstance(a, bytes) and isinstance(b, bytes)
             assert len(a) == len(b) == 32
+
+
+def _wrapped_app(mode: str = "required"):
+    """A two-route application (one HTTP, one WebSocket) behind the
+    middleware, with nothing exempt."""
+    from starlette.applications import Starlette
+    from starlette.responses import PlainTextResponse
+    from starlette.routing import Route, WebSocketRoute
+
+    async def page(request):
+        return PlainTextResponse("served")
+
+    async def socket(websocket):
+        await websocket.accept()
+        await websocket.send_text("served")
+        await websocket.close()
+
+    inner = Starlette(routes=[Route("/page", page), WebSocketRoute("/socket", socket)])
+    settings = _settings(mode)
+    return auth.BearerAuthMiddleware(inner, get_settings=lambda: settings, exempt_paths=())
+
+
+class TestMiddleware:
+    def test_a_websocket_without_a_token_is_closed_before_it_is_accepted(self):
+        from starlette.testclient import TestClient
+        from starlette.websockets import WebSocketDisconnect
+
+        client = TestClient(_wrapped_app())
+
+        with pytest.raises(WebSocketDisconnect) as excinfo:
+            with client.websocket_connect("/socket"):
+                pass
+
+        assert excinfo.value.code == 1008
+
+    def test_a_websocket_with_the_right_token_is_served(self):
+        from starlette.testclient import TestClient
+
+        client = TestClient(_wrapped_app())
+
+        with client.websocket_connect(
+            "/socket", headers={"Authorization": f"Bearer {TOKEN_A}"}
+        ) as websocket:
+            assert websocket.receive_text() == "served"
+
+    async def test_a_request_with_no_client_address_is_refused_and_logged(self, caplog):
+        sent = []
+
+        async def send(message):
+            sent.append(message)
+
+        async def receive():
+            return {"type": "http.request", "body": b"", "more_body": False}
+
+        scope = {"type": "http", "method": "GET", "path": "/page", "headers": []}
+        with caplog.at_level("INFO", logger="email_agent.auth"):
+            await _wrapped_app()(scope, receive, send)
+
+        assert sent[0]["status"] == 401
+        assert "GET /page from an unknown address" in caplog.text

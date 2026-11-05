@@ -26,6 +26,7 @@ import httpx
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 
+from auth import AuthSettings, BearerAuthMiddleware, load_auth_settings
 from gmail_utils import (
     get_header,
     normalize_header_text,
@@ -112,6 +113,25 @@ async def lifespan(_app: FastAPI):
 
 
 app = FastAPI(title="Email Agent Server v2", version="2.0", lifespan=lifespan)
+
+# The only paths served without a bearer token. Everything else -- every
+# route below, the documentation routes, and any path that is not a route at
+# all -- goes through the token check, because the check wraps the whole
+# application rather than being attached to routes one by one.
+AUTH_EXEMPT_PATHS = frozenset({"/health"})
+
+
+def _auth_settings() -> AuthSettings:
+    """The settings the token check uses for a request, read from the
+    environment."""
+    return load_auth_settings(os.environ)
+
+
+app.add_middleware(
+    BearerAuthMiddleware,
+    get_settings=_auth_settings,
+    exempt_paths=AUTH_EXEMPT_PATHS,
+)
 
 
 class LLMError(Exception):

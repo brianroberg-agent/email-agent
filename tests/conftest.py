@@ -7,10 +7,30 @@ from fastapi.testclient import TestClient
 
 from email_server import app
 
+# Synthetic credentials for the test suite. Not a real token.
+TEST_CALLER = "tests"
+TEST_API_TOKEN = "synthetic-test-token-0000000000000001"
+WRONG_API_TOKEN = "synthetic-wrong-token-999999999999999"
+
+
+@pytest.fixture(autouse=True)
+def auth_environment(monkeypatch):
+    """Run every test the way a deployment runs: authentication required,
+    one named token configured. A test that needs another mode overrides
+    these two variables with monkeypatch.setenv."""
+    monkeypatch.setenv("EMAIL_AGENT_AUTH", "required")
+    monkeypatch.setenv("EMAIL_AGENT_API_KEYS", f"{TEST_CALLER}:{TEST_API_TOKEN}")
+
 
 @pytest.fixture
 def client():
-    """FastAPI test client."""
+    """FastAPI test client that sends the configured test token."""
+    return TestClient(app, headers={"Authorization": f"Bearer {TEST_API_TOKEN}"})
+
+
+@pytest.fixture
+def anonymous_client():
+    """FastAPI test client that sends no Authorization header."""
     return TestClient(app)
 
 

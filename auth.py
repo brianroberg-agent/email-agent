@@ -2,11 +2,15 @@
 
 import hashlib
 import hmac
+import json
+import logging
 import re
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Mapping, Optional, Sequence
+from typing import Callable, Iterable, Mapping, Optional, Sequence
 
+
+logger = logging.getLogger("email_agent.auth")
 
 KEYS_ENV = "EMAIL_AGENT_API_KEYS"
 MODE_ENV = "EMAIL_AGENT_AUTH"
@@ -170,3 +174,89 @@ def parse_api_keys(raw: Optional[str]) -> tuple[ApiKey, ...]:
 
 def _entry_error(position: int, problem: str) -> AuthConfigError:
     return AuthConfigError(f"{KEYS_ENV}: entry {position} {problem}")
+
+
+UNAUTHORIZED_DETAIL = "Missing or invalid bearer token"
+
+
+def _printable(text: str) -> str:
+    """Escape control and non-ASCII characters, so request text placed in a
+    log line cannot start a new line or drive a terminal."""
+    return text.encode("unicode_escape").decode("ascii")
+
+
+def _describe_request(scope) -> str:
+    """'<METHOD> <path> from <client address>'. The query string and the
+    headers are left out."""
+    method = _printable(str(scope.get("method") or scope["type"]))
+    path = _printable(str(scope.get("path") or ""))
+    client = scope.get("client")
+    origin = _printable(str(client[0])) if client else "an unknown address"
+    return f"{method} {path} from {origin}"
+
+
+def _log_decision(decision: Decision, scope) -> None:
+    """One log line per checked request. It carries the method, the path,
+    the client address and, for a valid token, the caller's name."""
+    request = _describe_request(scope)
+    if not decision.allowed:
+        reason = "no token" if decision.credential == "none" else "invalid token"
+        logger.warning("auth: refused %s (%s)", request, reason)
+    elif decision.credential == "none":
+        logger.warning("auth: unauthenticated request served (optional mode): %s", request)
+    elif decision.credential == "valid":
+        logger.info("auth: %s authenticated as '%s'", request, decision.caller)
+
+
+class BearerAuthMiddleware:
+    """ASGI middleware that applies decide() to every request.
+
+    It wraps the whole application, so it runs before routing: a request is
+    checked whether or not its path is registered. Only a path listed in
+    `exempt_paths` (exact match) skips the check.
+    """
+
+    def __init__(
+        self,
+        app,
+        *,
+        get_settings: Callable[[], AuthSettings],
+        exempt_paths: Iterable[str],
+    ) -> None:
+        self.app = app
+        self.get_settings = get_settings
+        self.exempt_paths = frozenset(exempt_paths)
+
+    async def __call__(self, scope, receive, send) -> None:
+        if scope["type"] == "lifespan" or scope.get("path") in self.exempt_paths:
+            await self.app(scope, receive, send)
+            return
+        authorization = [
+            value.decode("latin-1")
+            for name, value in scope.get("headers") or []
+            if name == b"authorization"
+        ]
+        decision = decide(self.get_settings(), authorization)
+        _log_decision(decision, scope)
+        if decision.allowed:
+            await self.app(scope, receive, send)
+            return
+        if scope["type"] == "websocket":
+            # Closing before accepting refuses the handshake (policy violation).
+            await send({"type": "websocket.close", "code": 1008})
+            return
+        if scope["type"] != "http":
+            return
+        body = json.dumps({"detail": UNAUTHORIZED_DETAIL}).encode("utf-8")
+        await send(
+            {
+                "type": "http.response.start",
+                "status": 401,
+                "headers": [
+                    (b"content-type", b"application/json"),
+                    (b"content-length", str(len(body)).encode("ascii")),
+                    (b"www-authenticate", b"Bearer"),
+                ],
+            }
+        )
+        await send({"type": "http.response.body", "body": body})
