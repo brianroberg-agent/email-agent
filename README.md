@@ -176,7 +176,7 @@ email-agent: WARNING auth: unauthenticated request served (optional mode): GET /
 
 A line carries the method, the path, the client address and, for a configured token, the caller's name. The query string and the request headers are left out. Requests to `/health` are not logged by the check, and in `off` mode it logs no requests.
 
-The lines come from the Python logger `email_agent.auth`. When the service starts, it adds its stderr handler to that logger only if no handler would otherwise receive the logger's records: none on the logger itself and none on the root logger. If there is one, the service adds none, and the lines go wherever the existing handlers send them, each line once. If the logger's own level is unset, the service sets it to `INFO` while it runs, so the `INFO` lines reach whichever handler there is; a level set on the logger beforehand is left as it is.
+The lines come from the Python logger `email_agent.auth`. When the service starts, it adds its stderr handler to that logger only if no handler would otherwise receive the logger's records: none on the logger itself or on the loggers above it (`email_agent` and the root logger). If there is one, the service adds none, so it does not write a second copy of a line the existing handlers already write; the lines go wherever those handlers send them. If the logger's own level is unset, the service sets it to `INFO` while it runs, so the `INFO` lines reach whichever handler there is; a level set on the logger beforehand is left as it is.
 
 ### API documentation routes
 
