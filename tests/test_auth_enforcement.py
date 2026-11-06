@@ -174,6 +174,27 @@ class TestHealthIsOpen:
         assert auth_records(auth_log) == []
 
 
+class TestUnderAPathPrefix:
+    """The exemption is an exact match on the path the check sees. Mounted
+    under a prefix, that path carries the prefix, so nothing is exempt."""
+
+    @staticmethod
+    def mounted_client(headers=None):
+        from starlette.applications import Starlette
+        from starlette.routing import Mount
+
+        return TestClient(Starlette(routes=[Mount("/mail", app=app)]), headers=headers)
+
+    def test_the_health_check_needs_a_token_under_a_prefix(self):
+        assert_unauthorized(self.mounted_client().get("/mail/health"))
+
+    def test_the_health_check_answers_with_the_token_under_a_prefix(self):
+        response = self.mounted_client(BEARER).get("/mail/health")
+
+        assert response.status_code == 200
+        assert response.json() == {"status": "ok", "version": "2.0"}
+
+
 class TestRequiredMode:
     def test_the_right_token_gets_the_routes_normal_answer(self, gmail, anonymous_client):
         response = anonymous_client.get("/labels", headers=BEARER)

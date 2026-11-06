@@ -128,9 +128,9 @@ The service keeps a SHA-256 digest of each token rather than the token text, and
 
 "Wrong token" means any `Authorization` header that is not exactly one `Bearer <configured token>`: an unknown token, another scheme such as `Basic`, an empty header, or two `Authorization` headers. The scheme may be written in any case and followed by one or more spaces before the token. Other whitespace (a tab, a no-break space) or any other text before the scheme or after the token makes it a wrong token. The HTTP server in front of the application may strip spaces and tabs at the very start and end of a header value before the check sees it.
 
-`GET /health` answers without a token in all three modes.
+`GET /health` answers without a token in all three modes when the service is served at the root of its host, as the start command under Usage does. Under a path prefix (the application mounted inside another one, or `uvicorn --root-path`) the check sees the prefixed path, which is not on the exempt list, so the health check needs a token there as well.
 
-The settings are read when the service starts, so changing them takes a restart. If the application is run without its start-up step (`uvicorn --lifespan off`, or mounted inside another application), they are read instead at the first request the check sees, and kept for the life of the process. If they cannot be loaded then, a request to any path other than `/health` gets `503` with `{"detail": "Authentication is not configured"}`, and one `ERROR` line naming the problem is logged at that first request.
+The settings are read when the service starts, so changing them takes a restart. If the application is run without its start-up step (`uvicorn --lifespan off`, or mounted inside another application), they are read instead at the first request the check sees, and kept for the life of the process. If they cannot be loaded then, a request to any path other than `/health` gets `503` with `{"detail": "Authentication is not configured"}`, and one `ERROR` line naming the problem is logged at that first request. On this path the start-up lines described under Log lines are not written, including the warning that `off` mode serves every request, because they are written by the start-up step.
 
 ### Minting a token
 
