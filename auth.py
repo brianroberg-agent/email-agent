@@ -2,13 +2,13 @@
 
 import hashlib
 import hmac
-import json
 import logging
 import re
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from enum import Enum
 
+from starlette.datastructures import Headers
 from starlette.responses import JSONResponse
 
 logger = logging.getLogger("email_agent.auth")
@@ -341,11 +341,7 @@ class BearerAuthMiddleware:
         if scope["type"] == "lifespan" or scope.get("path") in self.exempt_paths:
             await self.app(scope, receive, send)
             return
-        authorization = [
-            value.decode("latin-1")
-            for name, value in scope.get("headers") or []
-            if name == b"authorization"
-        ]
+        authorization = Headers(raw=list(scope.get("headers") or [])).getlist("authorization")
         settings = self.get_settings()
         if settings is None:
             await self._refuse_unconfigured(scope, receive, send)
@@ -361,19 +357,12 @@ class BearerAuthMiddleware:
             return
         if scope["type"] != "http":
             return
-        body = json.dumps({"detail": UNAUTHORIZED_DETAIL}).encode("utf-8")
-        await send(
-            {
-                "type": "http.response.start",
-                "status": 401,
-                "headers": [
-                    (b"content-type", b"application/json"),
-                    (b"content-length", str(len(body)).encode("ascii")),
-                    (b"www-authenticate", b"Bearer"),
-                ],
-            }
+        response = JSONResponse(
+            {"detail": UNAUTHORIZED_DETAIL},
+            status_code=401,
+            headers={"WWW-Authenticate": "Bearer"},
         )
-        await send({"type": "http.response.body", "body": body})
+        await response(scope, receive, send)
 
 
     @staticmethod
