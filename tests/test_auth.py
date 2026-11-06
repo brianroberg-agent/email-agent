@@ -12,27 +12,32 @@ TOKEN_B = "synthetic-token-bbbbbbbbbbbbbbbbbbbbbbbb"
 TOKEN_C = "synthetic-token-cccccccccccccccccccccccc"
 
 
+def _accepts(key: "auth.ApiKey", token: str) -> bool:
+    """Whether `token` matches `key`, asked the way the server asks."""
+    return auth.match_token(token, [key]) == key.name
+
+
 class TestParseApiKeys:
     def test_single_pair_gives_one_named_key(self):
         keys = auth.parse_api_keys(f"alpha:{TOKEN_A}")
 
         assert [key.name for key in keys] == ["alpha"]
-        assert keys[0].matches(TOKEN_A)
-        assert not keys[0].matches(TOKEN_B)
+        assert _accepts(keys[0], TOKEN_A)
+        assert not _accepts(keys[0], TOKEN_B)
 
     def test_several_pairs_keep_their_order_and_their_own_tokens(self):
         keys = auth.parse_api_keys(f"alpha:{TOKEN_A},beta:{TOKEN_B}")
 
         assert [key.name for key in keys] == ["alpha", "beta"]
-        assert keys[0].matches(TOKEN_A) and not keys[0].matches(TOKEN_B)
-        assert keys[1].matches(TOKEN_B) and not keys[1].matches(TOKEN_A)
+        assert _accepts(keys[0], TOKEN_A) and not _accepts(keys[0], TOKEN_B)
+        assert _accepts(keys[1], TOKEN_B) and not _accepts(keys[1], TOKEN_A)
 
     def test_whitespace_around_entries_names_and_tokens_is_ignored(self):
         keys = auth.parse_api_keys(f"  alpha : {TOKEN_A} ,\n beta:{TOKEN_B}  ")
 
         assert [key.name for key in keys] == ["alpha", "beta"]
-        assert keys[0].matches(TOKEN_A)
-        assert keys[1].matches(TOKEN_B)
+        assert _accepts(keys[0], TOKEN_A)
+        assert _accepts(keys[1], TOKEN_B)
 
     def test_blank_entries_from_stray_commas_are_skipped(self):
         keys = auth.parse_api_keys(f"alpha:{TOKEN_A},,beta:{TOKEN_B},")
@@ -121,7 +126,7 @@ class TestParseApiKeysRejectsMalformedSettings:
         token = "s" * auth.MIN_TOKEN_LENGTH
 
         assert auth.MIN_TOKEN_LENGTH == 32
-        assert auth.parse_api_keys(f"alpha:{token}")[0].matches(token)
+        assert _accepts(auth.parse_api_keys(f"alpha:{token}")[0], token)
 
     def test_a_name_of_31_characters_is_accepted(self):
         name = "n" * 31
@@ -467,4 +472,4 @@ class TestDocumentedMintingCommand:
         token = secrets.token_urlsafe(32)
 
         assert len(token) == 43
-        assert auth.parse_api_keys(f"assistant:{token}")[0].matches(token)
+        assert _accepts(auth.parse_api_keys(f"assistant:{token}")[0], token)

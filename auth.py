@@ -43,9 +43,6 @@ class ApiKey:
     name: str
     digest: bytes = field(repr=False)
 
-    def matches(self, presented: str) -> bool:
-        return hmac.compare_digest(self.digest, _digest(presented))
-
 
 class AuthMode(str, Enum):
     REQUIRED = "required"
