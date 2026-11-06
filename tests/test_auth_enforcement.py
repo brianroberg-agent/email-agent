@@ -411,6 +411,15 @@ class TestMisconfigurationWithoutStartup:
             assert response.json() == NOT_CONFIGURED_BODY
         assert not gmail.called and not llm.called
 
+    @pytest.mark.parametrize("path", ["/no-such-route", "/health/"])
+    def test_a_path_that_is_not_a_route_answers_503_too(self, path, monkeypatch, anonymous_client):
+        monkeypatch.setenv("EMAIL_AGENT_API_KEYS", "")
+
+        response = anonymous_client.get(path, headers=BEARER, follow_redirects=False)
+
+        assert response.status_code == 503
+        assert response.json() == NOT_CONFIGURED_BODY
+
     def test_the_failure_is_logged_once_however_many_requests_arrive(
         self, monkeypatch, gmail, anonymous_client, auth_log
     ):
