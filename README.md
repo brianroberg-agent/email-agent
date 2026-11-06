@@ -7,7 +7,7 @@ A privacy-focused FastAPI server that wraps the Gmail API for use with AI agents
 ```
 Claude Code (cloud, orchestrator)
     │
-    │  structured HTTP endpoints (JSON)
+    │  structured HTTP endpoints (JSON, bearer token)
     ▼
 email_server.py (local FastAPI server, port 8081)
     │                        │
@@ -47,6 +47,12 @@ No separate install step needed. The `uv run` command automatically manages depe
    PROXY_API_KEY=aproxy_your_api_key_here
    ```
 
+3. Add a token for each caller of this service (see [Authentication](#authentication)):
+   ```
+   EMAIL_AGENT_API_KEYS=assistant:<paste-the-token-here>
+   ```
+   In the default mode the service refuses to start until at least one token is configured.
+
 ### Environment Variables
 
 | Variable | Required | Default | Description |
@@ -57,6 +63,8 @@ No separate install step needed. The `uv run` command automatically manages depe
 | `MLX_URL` | No | `http://localhost:8080/v1/chat/completions` | Local LLM endpoint |
 | `MLX_MODEL` | No | `qwen/qwen3-14b` | Model name for LLM requests |
 | `LLM_MAX_TOKENS` | No | `4096` | Token budget per LLM completion (reasoning + answer) |
+| `EMAIL_AGENT_API_KEYS` | Yes, unless `EMAIL_AGENT_AUTH` is `optional` or `off` | - | Comma-separated `name:token` pairs, one per caller of this service (see [Authentication](#authentication)) |
+| `EMAIL_AGENT_AUTH` | No | `required` | `required`, `optional` or `off`: whether callers must send a bearer token (see [Authentication](#authentication)) |
 | `LLM_BACKEND_NAME` | No | `the model server` | Product name of the server behind `MLX_URL`, used only in diagnostic/error text ("Cannot reach {name} at {MLX_URL} ..."). Set it to what is actually deployed (e.g. `Ollama`) so errors name the right thing |
 
 ### OAuth Setup
@@ -64,6 +72,118 @@ No separate install step needed. The `uv run` command automatically manages depe
 `GOOGLE_CLIENT_ID` and `GOOGLE_CLIENT_SECRET` are required by the one-time `setup_oauth.py`
 script (run on a machine with a browser to produce `token.json`) — they are not read by
 `email_server.py` itself, so they're not in the table above.
+
+## Authentication
+
+In the default mode, every route except `GET /health` needs a bearer token:
+
+```
+Authorization: Bearer <token>
+```
+
+The check sits in front of the whole application and runs before routing, so it covers the API routes, the documentation routes (`/docs`, `/redoc`, `/openapi.json`) and paths that are not routes at all. A request that fails it gets:
+
+```
+HTTP/1.1 401 Unauthorized
+WWW-Authenticate: Bearer
+Content-Type: application/json
+
+{"detail": "Missing or invalid bearer token"}
+```
+
+The body is the same for a missing token and a wrong one; the server log says which.
+
+### Settings
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `EMAIL_AGENT_API_KEYS` | - | Comma-separated `name:token` pairs, one per caller, e.g. `assistant:<token>,scripts:<token>` |
+| `EMAIL_AGENT_AUTH` | `required` | `required`, `optional` or `off` (see Modes) |
+
+Rules for `EMAIL_AGENT_API_KEYS`:
+
+- A **name** is 1 to 31 characters from letters, digits, `.`, `_` and `-`. It identifies the caller in the log.
+- A **token** is at least 32 printable ASCII characters, with no spaces and no commas.
+- No name and no token may appear twice.
+
+A value that breaks a rule stops the service at start-up. The message gives the position of the offending entry (`entry 2 ...`) and repeats nothing from the value.
+
+Give each caller its own name and token. To replace one caller's token, change that caller's pair and restart the service; the other pairs are unaffected.
+
+The service keeps a SHA-256 digest of each token rather than the token text, and compares a presented token against every configured key with `hmac.compare_digest`.
+
+### Modes
+
+| `EMAIL_AGENT_AUTH` | No `Authorization` header | Wrong token | Configured token |
+|--------------------|---------------------------|-------------|------------------|
+| `required` (default) | 401 | 401 | served |
+| `optional` | served, and logged as a warning | 401 | served |
+| `off` | served | served | served |
+
+- **`required`**: with no tokens configured the service refuses to start. It prints `email-agent: ERROR refusing to start: ...`, naming both settings, and under `uvicorn` exits with a non-zero status before it binds its port.
+- **`optional`**: for moving an existing deployment over. A request with no `Authorization` header is served and produces one warning line with the method, path and client address, so the callers that have not been given a token yet can be found.
+- **`off`**: no authentication. The service logs a warning at start-up saying so.
+
+"Wrong token" means any `Authorization` header that is not exactly one `Bearer <configured token>`: an unknown token, another scheme such as `Basic`, an empty header, or two `Authorization` headers.
+
+`GET /health` answers without a token in all three modes.
+
+### Minting a token
+
+```bash
+python3 -c "import secrets; print(secrets.token_urlsafe(32))"
+```
+
+That prints a 43-character token. Put it in `.env` under a name for the caller:
+
+```
+EMAIL_AGENT_API_KEYS=assistant:<paste-the-token-here>
+```
+
+and give the same token to that caller. The examples in this README read it from an `EMAIL_AGENT_TOKEN` variable in the calling shell (a name of this README's choosing; the service does not read it):
+
+```bash
+export EMAIL_AGENT_TOKEN=<paste-the-token-here>
+curl http://localhost:8081/labels \
+  -H "Authorization: Bearer $EMAIL_AGENT_TOKEN"
+```
+
+### Rolling it out to a running deployment
+
+`required` is the default, so **a deployment upgraded to this version with neither setting in its environment does not start**: it exits at start-up with the message above. Set the two variables before, or together with, the upgrade. Where the service runs in a container, check that both variables are actually passed into the container's environment.
+
+1. Mint a token for each caller. Set `EMAIL_AGENT_API_KEYS` to the pairs and `EMAIL_AGENT_AUTH=optional`, then restart. Callers without a token keep working, and each of their requests is logged.
+2. Give each caller its token. The `unauthenticated request served` lines in the log show which routes are still being called without one, and from which address.
+3. When those lines have stopped, set `EMAIL_AGENT_AUTH=required` (or remove the setting) and restart.
+
+To back out, set `EMAIL_AGENT_AUTH=off` and restart.
+
+### Log lines
+
+While the service runs, the token check writes one line per checked request to stderr:
+
+```
+email-agent: INFO auth: EMAIL_AGENT_AUTH=required: every route except the health check needs a bearer token; tokens are configured for: assistant, scripts
+email-agent: INFO auth: GET /labels from 192.0.2.10 authenticated as 'assistant'
+email-agent: WARNING auth: refused POST /search from 192.0.2.10 (no token)
+email-agent: WARNING auth: refused POST /search from 192.0.2.10 (invalid token)
+email-agent: WARNING auth: unauthenticated request served (optional mode): GET /labels from 192.0.2.10
+```
+
+A line carries the method, the path, the client address and, for a configured token, the caller's name. The query string and the request headers are left out. Requests to `/health` are not logged by the check, and in `off` mode it logs no requests.
+
+The lines come from the Python logger `email_agent.auth`. If that logger already has a handler of its own when the service starts, the service adds none and the lines go wherever that handler sends them.
+
+### API documentation routes
+
+`/docs`, `/redoc` and `/openapi.json` go through the same check, so in `required` mode a browser opened on `/docs` gets the 401. Fetch the OpenAPI document with the header instead:
+
+```bash
+curl http://localhost:8081/openapi.json \
+  -H "Authorization: Bearer $EMAIL_AGENT_TOKEN"
+```
+
+The document declares the bearer scheme (`components.securitySchemes.bearerAuth`), required for every operation except `GET /health`.
 
 ## Usage
 
@@ -74,6 +194,8 @@ uv run uvicorn email_server:app --host 0.0.0.0 --port 8081
 ```
 
 Ensure the proxy server is running and accessible at the configured `PROXY_URL`.
+
+Every example below except the health check sends the caller's token from an `EMAIL_AGENT_TOKEN` shell variable (see [Authentication](#authentication)).
 
 ## API Endpoints
 
@@ -95,7 +217,8 @@ Response:
 List all available Gmail labels with message counts.
 
 ```bash
-curl http://localhost:8081/labels
+curl http://localhost:8081/labels \
+  -H "Authorization: Bearer $EMAIL_AGENT_TOKEN"
 ```
 
 Response:
@@ -136,6 +259,7 @@ To draft a reply to a search result, pass to `/drafts/create`:
 
 ```bash
 curl -X POST http://localhost:8081/search \
+  -H "Authorization: Bearer $EMAIL_AGENT_TOKEN" \
   -H "Content-Type: application/json" \
   -d '{"from_addr": "sender@example.com", "limit": 5}'
 ```
@@ -185,6 +309,7 @@ Summarize a specific email using the local LLM. The raw email body is never retu
 
 ```bash
 curl -X POST http://localhost:8081/summarize \
+  -H "Authorization: Bearer $EMAIL_AGENT_TOKEN" \
   -H "Content-Type: application/json" \
   -d '{"message_id": "18d5a3b2c4e5f6a7"}'
 ```
@@ -207,6 +332,7 @@ Ask a specific question about an email using the local LLM.
 
 ```bash
 curl -X POST http://localhost:8081/ask-about \
+  -H "Authorization: Bearer $EMAIL_AGENT_TOKEN" \
   -H "Content-Type: application/json" \
   -d '{"message_id": "18d5a3b2c4e5f6a7", "question": "Did they mention a deadline?"}'
 ```
@@ -227,6 +353,7 @@ Mark an email as read by removing the UNREAD label.
 
 ```bash
 curl -X POST http://localhost:8081/mark-read \
+  -H "Authorization: Bearer $EMAIL_AGENT_TOKEN" \
   -H "Content-Type: application/json" \
   -d '{"email_id": "18d5a3b2c4e5f6a7"}'
 ```
@@ -242,6 +369,7 @@ Apply a label to an email.
 
 ```bash
 curl -X POST http://localhost:8081/apply-label \
+  -H "Authorization: Bearer $EMAIL_AGENT_TOKEN" \
   -H "Content-Type: application/json" \
   -d '{"email_id": "18d5a3b2c4e5f6a7", "label_name": "STARRED"}'
 ```
@@ -263,6 +391,7 @@ Archive an email by removing it from the inbox.
 
 ```bash
 curl -X POST http://localhost:8081/archive \
+  -H "Authorization: Bearer $EMAIL_AGENT_TOKEN" \
   -H "Content-Type: application/json" \
   -d '{"email_id": "18d5a3b2c4e5f6a7"}'
 ```
@@ -278,6 +407,7 @@ Move an email to Trash. This is the sanctioned, recoverable delete path — it c
 
 ```bash
 curl -X POST http://localhost:8081/trash \
+  -H "Authorization: Bearer $EMAIL_AGENT_TOKEN" \
   --max-time 340 \
   -H "Content-Type: application/json" \
   -d '{"email_id": "18d5a3b2c4e5f6a7"}'
@@ -302,6 +432,7 @@ Remove an email from Trash, restoring it to its prior labels.
 
 ```bash
 curl -X POST http://localhost:8081/untrash \
+  -H "Authorization: Bearer $EMAIL_AGENT_TOKEN" \
   --max-time 340 \
   -H "Content-Type: application/json" \
   -d '{"email_id": "18d5a3b2c4e5f6a7"}'
@@ -320,6 +451,7 @@ Summarize multiple emails with triage information. Processes emails sequentially
 
 ```bash
 curl -X POST http://localhost:8081/batch-summarize \
+  -H "Authorization: Bearer $EMAIL_AGENT_TOKEN" \
   -H "Content-Type: application/json" \
   -d '{"message_ids": ["18d5a3b2c4e5f6a7", "18d5a3b2c4e5f6a8"]}'
 ```
@@ -370,6 +502,7 @@ Apply per-email operations in a single request. Each email can have different op
 
 ```bash
 curl -X POST http://localhost:8081/bulk-actions \
+  -H "Authorization: Bearer $EMAIL_AGENT_TOKEN" \
   -H "Content-Type: application/json" \
   -d '{
     "actions": [
@@ -416,6 +549,7 @@ Create a new email draft from structured fields. Constructs an RFC 2822 message 
 
 ```bash
 curl -X POST http://localhost:8081/drafts/create \
+  -H "Authorization: Bearer $EMAIL_AGENT_TOKEN" \
   -H "Content-Type: application/json" \
   -d '{"to": ["alice@example.com"], "subject": "Meeting follow-up", "body": "Thanks for the meeting.", "cc": ["bob@example.com"]}'
 ```
@@ -438,7 +572,8 @@ Response (for a reply create that resolved its conversation — a plain non-repl
 List all drafts with preview information.
 
 ```bash
-curl http://localhost:8081/drafts
+curl http://localhost:8081/drafts \
+  -H "Authorization: Bearer $EMAIL_AGENT_TOKEN"
 ```
 
 Response:
@@ -451,7 +586,8 @@ Response:
 Get full details of a specific draft.
 
 ```bash
-curl http://localhost:8081/drafts/{draft_id}
+curl http://localhost:8081/drafts/{draft_id} \
+  -H "Authorization: Bearer $EMAIL_AGENT_TOKEN"
 ```
 
 Response:
@@ -465,6 +601,7 @@ Update an existing draft with new content.
 
 ```bash
 curl -X POST http://localhost:8081/drafts/{draft_id}/update \
+  -H "Authorization: Bearer $EMAIL_AGENT_TOKEN" \
   -H "Content-Type: application/json" \
   -d '{"to": ["bob@example.com"], "subject": "Updated subject", "body": "Updated body"}'
 ```
@@ -486,7 +623,8 @@ Every warning appears twice: as a `(warning: ...)` note in `message`, and as an 
 Delete a draft permanently.
 
 ```bash
-curl -X DELETE http://localhost:8081/drafts/{draft_id}
+curl -X DELETE http://localhost:8081/drafts/{draft_id} \
+  -H "Authorization: Bearer $EMAIL_AGENT_TOKEN"
 ```
 
 Response:
@@ -541,7 +679,7 @@ Run tests:
 uv run --extra dev pytest tests/ -v
 ```
 
-The test suite uses mocked proxy client and LLM responses - no credentials required.
+The test suite uses mocked proxy client and LLM responses - no credentials required. It runs with authentication in `required` mode and a synthetic token that the shared test client sends (`tests/conftest.py`).
 
 ## License
 

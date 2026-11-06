@@ -373,3 +373,15 @@ class TestMiddleware:
 
         assert sent[0]["status"] == 401
         assert "GET /page from an unknown address" in caplog.text
+
+
+class TestDocumentedMintingCommand:
+    def test_a_token_minted_the_documented_way_is_accepted(self):
+        """README.md tells the operator to mint a token with
+        secrets.token_urlsafe(32) and says it is 43 characters long."""
+        import secrets
+
+        token = secrets.token_urlsafe(32)
+
+        assert len(token) == 43
+        assert auth.parse_api_keys(f"assistant:{token}")[0].matches(token)
