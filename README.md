@@ -128,6 +128,8 @@ The service keeps a SHA-256 digest of each token rather than the token text, and
 
 `GET /health` answers without a token in all three modes.
 
+The settings are read when the service starts, so changing them takes a restart. If the application is run without its start-up step (`uvicorn --lifespan off`, or mounted inside another application), they are read instead at the first request the check sees, and kept for the life of the process. If they cannot be loaded then, a request to any path other than `/health` gets `503` with `{"detail": "Authentication is not configured"}`, and one `ERROR` line naming the problem is logged at that first request.
+
 ### Minting a token
 
 ```bash

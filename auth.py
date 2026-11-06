@@ -9,6 +9,8 @@ from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from enum import Enum
 
+from starlette.responses import JSONResponse
+
 logger = logging.getLogger("email_agent.auth")
 
 KEYS_ENV = "EMAIL_AGENT_API_KEYS"
@@ -78,6 +80,36 @@ def load_auth_settings(environ: Mapping[str, str]) -> AuthSettings:
             f"set {MODE_ENV} to 'optional' or 'off'."
         )
     return AuthSettings(mode=mode, keys=keys)
+
+
+class SettingsFromEnvironment:
+    """Settings for requests that arrive when the start-up hook has not
+    loaded them (the application driven with its lifespan off, or mounted
+    inside another application).
+
+    The first call reads `environ`; every later call returns that same
+    result without reading `environ` again. If the settings cannot be
+    loaded, the call returns None (the middleware then answers 503) and one
+    ERROR line is logged, on that first call only.
+    """
+
+    def __init__(self, environ: Mapping[str, str]) -> None:
+        self._environ = environ
+        self._read = False
+        self._settings: AuthSettings | None = None
+
+    def __call__(self) -> AuthSettings | None:
+        if not self._read:
+            self._read = True
+            try:
+                self._settings = load_auth_settings(self._environ)
+            except AuthConfigError as error:
+                logger.error(
+                    "auth: the settings could not be loaded, so every request "
+                    "except the exempt paths gets 503: %s",
+                    error,
+                )
+        return self._settings
 
 
 def startup_messages(settings: AuthSettings) -> list[tuple[int, str]]:
@@ -252,6 +284,7 @@ def _entry_error(position: int, problem: str) -> AuthConfigError:
 
 
 UNAUTHORIZED_DETAIL = "Missing or invalid bearer token"
+NOT_CONFIGURED_DETAIL = "Authentication is not configured"
 
 
 def _printable(text: str) -> str:
@@ -288,14 +321,16 @@ class BearerAuthMiddleware:
 
     It wraps the whole application, so it runs before routing: a request is
     checked whether or not its path is registered. Only a path listed in
-    `exempt_paths` (exact match) skips the check.
+    `exempt_paths` (exact match) skips the check. When `get_settings`
+    returns None (the settings could not be loaded), a checked HTTP request
+    gets 503 and a WebSocket handshake is closed with code 1011.
     """
 
     def __init__(
         self,
         app,
         *,
-        get_settings: Callable[[], AuthSettings],
+        get_settings: Callable[[], AuthSettings | None],
         exempt_paths: Iterable[str],
     ) -> None:
         self.app = app
@@ -311,7 +346,11 @@ class BearerAuthMiddleware:
             for name, value in scope.get("headers") or []
             if name == b"authorization"
         ]
-        decision = decide(self.get_settings(), authorization)
+        settings = self.get_settings()
+        if settings is None:
+            await self._refuse_unconfigured(scope, receive, send)
+            return
+        decision = decide(settings, authorization)
         _log_decision(decision, scope)
         if decision.allowed:
             await self.app(scope, receive, send)
@@ -335,6 +374,18 @@ class BearerAuthMiddleware:
             }
         )
         await send({"type": "http.response.body", "body": body})
+
+
+    @staticmethod
+    async def _refuse_unconfigured(scope, receive, send) -> None:
+        if scope["type"] == "websocket":
+            # Closing before accepting refuses the handshake (internal error).
+            await send({"type": "websocket.close", "code": 1011})
+            return
+        if scope["type"] != "http":
+            return
+        response = JSONResponse({"detail": NOT_CONFIGURED_DETAIL}, status_code=503)
+        await response(scope, receive, send)
 
 
 def declare_bearer_scheme(schema: dict, exempt_paths: Iterable[str]) -> dict:

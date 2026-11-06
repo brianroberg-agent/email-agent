@@ -1,10 +1,14 @@
 """Shared test fixtures for email server tests."""
 
 import base64
+import os
+
 import pytest
 from unittest.mock import Mock, AsyncMock
 from fastapi.testclient import TestClient
 
+import auth
+import email_server
 from email_server import app
 
 # Synthetic credentials for the test suite. Not a real token.
@@ -20,6 +24,18 @@ def auth_environment(monkeypatch):
     these two variables with monkeypatch.setenv."""
     monkeypatch.setenv("EMAIL_AGENT_AUTH", "required")
     monkeypatch.setenv("EMAIL_AGENT_API_KEYS", f"{TEST_CALLER}:{TEST_API_TOKEN}")
+    restart_settings_fallback(monkeypatch)
+
+
+def restart_settings_fallback(monkeypatch):
+    """Give the application a fresh request-time settings fallback, as a new
+    process would have. Most tests drive the application without its
+    start-up hook, and the fallback keeps what it first read for the life of
+    the process, so each test (and each change of mode within a test) starts
+    from a fresh one."""
+    monkeypatch.setattr(
+        email_server, "_fallback_auth_settings", auth.SettingsFromEnvironment(os.environ)
+    )
 
 
 @pytest.fixture

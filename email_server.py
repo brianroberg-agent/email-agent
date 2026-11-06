@@ -30,6 +30,7 @@ from auth import (
     AuthConfigError,
     AuthSettings,
     BearerAuthMiddleware,
+    SettingsFromEnvironment,
     StderrLogging,
     declare_bearer_scheme,
     load_auth_settings,
@@ -153,13 +154,19 @@ app = FastAPI(title="Email Agent Server v2", version="2.0", lifespan=lifespan)
 AUTH_EXEMPT_PATHS = frozenset({"/health"})
 
 
-def _auth_settings() -> AuthSettings:
+# Used only when the start-up hook has not loaded the settings: reads the
+# environment once, at the first request that needs it, and keeps the result
+# for the life of the process (see auth.SettingsFromEnvironment).
+_fallback_auth_settings = SettingsFromEnvironment(os.environ)
+
+
+def _auth_settings() -> AuthSettings | None:
     """The settings the token check uses for a request: the ones the
-    start-up hook loaded. If the application is being driven without its
-    start-up hook, they are read from the environment for each request, so a
-    bad configuration raises here instead of the request being served."""
+    start-up hook loaded, or, if the application is being driven without its
+    start-up hook, the fallback's. None means they could not be loaded, and
+    the check answers 503."""
     loaded = getattr(app.state, "auth_settings", None)
-    return loaded if loaded is not None else load_auth_settings(os.environ)
+    return loaded if loaded is not None else _fallback_auth_settings()
 
 
 app.add_middleware(

@@ -13,7 +13,12 @@ from fastapi.testclient import TestClient
 from starlette.routing import Route
 
 from email_server import app
-from tests.conftest import TEST_API_TOKEN, TEST_CALLER, WRONG_API_TOKEN
+from tests.conftest import (
+    TEST_API_TOKEN,
+    TEST_CALLER,
+    WRONG_API_TOKEN,
+    restart_settings_fallback,
+)
 
 # The only operation that answers without a token. Deliberately written out
 # here rather than imported from the application: if the application's
@@ -138,7 +143,10 @@ def auth_records(caplog):
 
 
 def set_mode(monkeypatch, mode):
+    """Switch mode as a restart would: set it and give the application a
+    fresh request-time settings fallback."""
     monkeypatch.setenv("EMAIL_AGENT_AUTH", mode)
+    restart_settings_fallback(monkeypatch)
 
 
 class TestHealthIsOpen:
@@ -334,28 +342,113 @@ class TestNoTokenLeaks:
             assert WRONG_API_TOKEN not in text
 
 
+NOT_CONFIGURED_BODY = {"detail": "Authentication is not configured"}
+
+
 class TestMisconfigurationWithoutStartup:
     """If the application is driven without its start-up hook (which is
-    where a bad configuration normally stops the service), a request is
-    still not served."""
+    where a bad configuration normally stops the service), the settings are
+    read when the first request needs them. A bad configuration then gets a
+    503 on every checked request, not a served request and not a 500."""
 
     @pytest.mark.parametrize("headers", [{}, BEARER], ids=["no token", "a token"])
-    def test_required_mode_with_no_tokens_serves_no_request(
+    def test_required_mode_with_no_tokens_answers_503_and_serves_nothing(
         self, headers, monkeypatch, gmail, anonymous_client
     ):
-        import auth
-
         monkeypatch.setenv("EMAIL_AGENT_API_KEYS", "")
 
-        with pytest.raises(auth.AuthConfigError):
-            anonymous_client.get("/labels", headers=headers)
+        response = anonymous_client.get("/labels", headers=headers)
 
+        assert response.status_code == 503
+        assert response.json() == NOT_CONFIGURED_BODY
+        assert response.headers["content-type"] == "application/json"
         assert not gmail.called
+
+    @pytest.mark.parametrize(
+        "mode, keys",
+        [
+            ("required", f"{TEST_CALLER}:short-{TEST_API_TOKEN[:8]}"),
+            ("optional", f"{TEST_CALLER}:{TEST_API_TOKEN},{TEST_CALLER}:{WRONG_API_TOKEN}"),
+            (f"mode-{TEST_API_TOKEN}", f"{TEST_CALLER}:{TEST_API_TOKEN}"),
+        ],
+        ids=["a token that is too short", "a duplicate name", "an unknown mode"],
+    )
+    def test_the_503_body_is_fixed_and_repeats_nothing_from_the_settings(
+        self, mode, keys, monkeypatch, gmail, anonymous_client, caplog
+    ):
+        monkeypatch.setenv("EMAIL_AGENT_AUTH", mode)
+        monkeypatch.setenv("EMAIL_AGENT_API_KEYS", keys)
+
+        response = anonymous_client.post("/search", json={}, headers=BEARER)
+
+        assert response.status_code == 503
+        assert response.json() == NOT_CONFIGURED_BODY
+        assert TEST_API_TOKEN[:8] not in response.text + repr(response.headers)
+        assert TEST_API_TOKEN not in caplog.text
+        assert not gmail.called
+
+    @pytest.mark.parametrize("method, path", PROTECTED_OPERATIONS, ids=_ids(PROTECTED_OPERATIONS))
+    def test_every_checked_route_answers_503(self, method, path, monkeypatch, anonymous_client):
+        monkeypatch.setenv("EMAIL_AGENT_API_KEYS", "")
+
+        with patch("email_server.get_gmail_client") as gmail, patch(
+            "email_server.call_local_llm"
+        ) as llm:
+            response = anonymous_client.request(method, path, headers=BEARER)
+
+        assert response.status_code == 503
+        if method != "HEAD":
+            assert response.json() == NOT_CONFIGURED_BODY
+        assert not gmail.called and not llm.called
+
+    def test_the_failure_is_logged_once_however_many_requests_arrive(
+        self, monkeypatch, gmail, anonymous_client, auth_log
+    ):
+        monkeypatch.setenv("EMAIL_AGENT_API_KEYS", "")
+
+        for _ in range(3):
+            anonymous_client.get("/labels", headers=BEARER)
+            anonymous_client.get("/labels")
+
+        errors = [r for r in auth_records(auth_log) if r.levelno == logging.ERROR]
+        assert len(errors) == 1
+        assert "EMAIL_AGENT_API_KEYS" in errors[0].getMessage()
+        assert not [r for r in auth_records(auth_log) if r.levelno == logging.WARNING]
 
     def test_the_health_check_still_answers(self, monkeypatch, anonymous_client):
         monkeypatch.setenv("EMAIL_AGENT_API_KEYS", "")
 
         assert anonymous_client.get("/health").status_code == 200
+
+    def test_a_good_configuration_is_read_once_and_authenticates_normally(
+        self, monkeypatch, gmail, anonymous_client
+    ):
+        import auth
+
+        real_parse = auth.parse_api_keys
+        parses = []
+
+        def counting_parse(raw):
+            parses.append(raw)
+            return real_parse(raw)
+
+        monkeypatch.setattr(auth, "parse_api_keys", counting_parse)
+
+        served = [anonymous_client.get("/labels", headers=BEARER).status_code for _ in range(3)]
+        refused = anonymous_client.get("/labels").status_code
+
+        assert served == [200, 200, 200]
+        assert refused == 401
+        assert len(parses) == 1
+
+    def test_a_later_change_to_the_environment_is_not_read(
+        self, monkeypatch, gmail, anonymous_client
+    ):
+        assert anonymous_client.get("/labels").status_code == 401
+
+        monkeypatch.setenv("EMAIL_AGENT_AUTH", "off")
+
+        assert anonymous_client.get("/labels").status_code == 401
 
 
 class TestOpenApiDeclaresTheScheme:

@@ -402,6 +402,37 @@ class TestMiddleware:
         assert "GET /page from an unknown address" in caplog.text
 
 
+def _unconfigured_app():
+    """The same two routes behind the middleware, with settings that could
+    not be loaded."""
+    app = _wrapped_app()
+    return auth.BearerAuthMiddleware(app.app, get_settings=lambda: None, exempt_paths=())
+
+
+class TestMiddlewareWithoutSettings:
+    @pytest.mark.parametrize("headers", [{}, {"Authorization": f"Bearer {TOKEN_A}"}])
+    def test_an_http_request_gets_503_with_the_fixed_detail(self, headers):
+        from starlette.testclient import TestClient
+
+        response = TestClient(_unconfigured_app()).get("/page", headers=headers)
+
+        assert response.status_code == 503
+        assert response.json() == {"detail": "Authentication is not configured"}
+
+    def test_a_websocket_is_closed_before_it_is_accepted(self):
+        from starlette.testclient import TestClient
+        from starlette.websockets import WebSocketDisconnect
+
+        client = TestClient(_unconfigured_app())
+
+        with pytest.raises(WebSocketDisconnect) as excinfo, client.websocket_connect(
+            "/socket", headers={"Authorization": f"Bearer {TOKEN_A}"}
+        ):
+            pass
+
+        assert excinfo.value.code == 1011
+
+
 class TestDocumentedMintingCommand:
     def test_a_token_minted_the_documented_way_is_accepted(self):
         """README.md tells the operator to mint a token with
