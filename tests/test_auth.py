@@ -48,6 +48,14 @@ class TestParseApiKeys:
     def test_unset_or_blank_setting_gives_no_keys(self, raw):
         assert auth.parse_api_keys(raw) == ()
 
+    def test_a_nameless_token_with_one_colon_is_read_as_a_name_and_a_token(self):
+        """The known limit of the format, as the README describes it: a
+        token pasted without its name, whose text has exactly one colon in
+        it, cannot be told apart from a name:token pair."""
+        keys = auth.parse_api_keys(f"Sk9x:{TOKEN_A}")
+
+        assert [key.name for key in keys] == ["Sk9x"]
+
     @pytest.mark.parametrize(
         "raw",
         [
