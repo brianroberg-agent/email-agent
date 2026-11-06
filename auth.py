@@ -154,35 +154,44 @@ def startup_messages(settings: AuthSettings) -> list[tuple[int, str]]:
 
 
 class StderrLogging:
-    """Writes the auth logger's lines to stderr while the service runs.
+    """Makes sure the auth logger's lines are written somewhere while the
+    service runs.
 
-    install() adds a stderr handler (and INFO level) to the auth logger
-    unless the logger already has a handler of its own, in which case the
-    operator's logging setup is left as it is. remove() undoes install().
+    install() does two things:
+
+    - It adds a stderr handler to the auth logger only if no handler would
+      otherwise receive its records (logger.hasHandlers() is false: none on
+      the auth logger or on any logger it propagates to), so a line is not
+      written twice.
+    - If the auth logger's own level is unset, it sets it to INFO, so the
+      INFO lines reach whichever handler there is. A level the operator set
+      is left alone.
+
+    remove() undoes both.
     """
 
     FORMAT = "email-agent: %(levelname)s %(message)s"
 
     def __init__(self) -> None:
         self._handler: logging.Handler | None = None
-        self._previous_level = logging.NOTSET
+        self._set_level = False
 
     def install(self) -> None:
-        if logger.handlers:
-            return
-        self._handler = logging.StreamHandler()
-        self._handler.setFormatter(logging.Formatter(self.FORMAT))
-        self._previous_level = logger.level
-        logger.addHandler(self._handler)
+        if not logger.hasHandlers():
+            self._handler = logging.StreamHandler()
+            self._handler.setFormatter(logging.Formatter(self.FORMAT))
+            logger.addHandler(self._handler)
         if logger.level == logging.NOTSET:
             logger.setLevel(logging.INFO)
+            self._set_level = True
 
     def remove(self) -> None:
-        if self._handler is None:
-            return
-        logger.removeHandler(self._handler)
-        logger.setLevel(self._previous_level)
-        self._handler = None
+        if self._handler is not None:
+            logger.removeHandler(self._handler)
+            self._handler = None
+        if self._set_level:
+            logger.setLevel(logging.NOTSET)
+            self._set_level = False
 
 
 @dataclass(frozen=True)

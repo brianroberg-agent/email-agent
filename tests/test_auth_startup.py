@@ -117,7 +117,7 @@ class TestOffModeIsTheWayBack:
 
 
 class TestStartupMessages:
-    def test_off_mode_warns_that_nothing_is_authenticated(self, monkeypatch, auth_log, capsys):
+    def test_off_mode_warns_that_nothing_is_authenticated(self, monkeypatch, auth_log):
         monkeypatch.setenv("EMAIL_AGENT_AUTH", "off")
 
         with TestClient(app):
@@ -126,7 +126,6 @@ class TestStartupMessages:
         (warning,) = auth_messages(auth_log, logging.WARNING)
         assert "EMAIL_AGENT_AUTH=off" in warning
         assert "without authentication" in warning
-        assert "email-agent: WARNING auth: EMAIL_AGENT_AUTH=off" in capsys.readouterr().err
 
     def test_optional_mode_warns_that_tokenless_requests_are_served(
         self, monkeypatch, auth_log
@@ -151,9 +150,7 @@ class TestStartupMessages:
         (warning,) = auth_messages(auth_log, logging.WARNING)
         assert "no tokens are configured" in warning
 
-    def test_required_mode_lists_the_caller_names_without_a_warning(
-        self, monkeypatch, auth_log, capsys
-    ):
+    def test_required_mode_lists_the_caller_names_without_a_warning(self, monkeypatch, auth_log):
         monkeypatch.setenv(
             "EMAIL_AGENT_API_KEYS", f"{TEST_CALLER}:{TEST_API_TOKEN},second:{SECOND_TOKEN}"
         )
@@ -165,7 +162,6 @@ class TestStartupMessages:
         (info,) = auth_messages(auth_log, logging.INFO)
         assert "EMAIL_AGENT_AUTH=required" in info
         assert f"{TEST_CALLER}, second" in info
-        assert "email-agent: INFO auth: EMAIL_AGENT_AUTH=required" in capsys.readouterr().err
 
     @pytest.mark.parametrize("mode", ["required", "optional", "off"])
     def test_start_up_output_holds_no_token(self, mode, monkeypatch, caplog, capsys):
@@ -217,38 +213,126 @@ class TestSettingsAreReadAtStartup:
         assert TestClient(app).get("/openapi.json").status_code == 200
 
 
+@contextmanager
+def no_root_handlers():
+    """Take every handler off the root logger for the block, as in a process
+    where nothing has configured logging. pytest attaches its own capture
+    handlers to the root logger during each test, so a test of what happens
+    without any has to remove them inside the test body."""
+    root = logging.getLogger()
+    saved = list(root.handlers)
+    for handler in saved:
+        root.removeHandler(handler)
+    try:
+        yield
+    finally:
+        for handler in saved:
+            root.addHandler(handler)
+
+
+class RecordingHandler(logging.Handler):
+    def __init__(self):
+        super().__init__()
+        self.messages = []
+
+    def emit(self, record):
+        self.messages.append(record.getMessage())
+
+
+@contextmanager
+def handler_on(logger_name):
+    handler = RecordingHandler()
+    target = logging.getLogger(logger_name)
+    target.addHandler(handler)
+    try:
+        yield handler
+    finally:
+        target.removeHandler(handler)
+
+
+AUTHENTICATED_LINE = f"auth: GET /openapi.json from testclient authenticated as '{TEST_CALLER}'"
+REQUIRED_STARTUP_LINE = "auth: EMAIL_AGENT_AUTH=required"
+
+
 class TestRequestLogReachesStderr:
     def test_request_lines_are_written_to_stderr_while_the_service_runs(self, capsys):
-        with TestClient(app) as client:
+        with no_root_handlers(), TestClient(app) as client:
             client.get("/openapi.json", headers=BEARER)
             client.get("/openapi.json")
 
         stderr = capsys.readouterr().err
-        assert (
-            f"email-agent: INFO auth: GET /openapi.json from testclient authenticated as '{TEST_CALLER}'"
-            in stderr
-        )
+        assert f"email-agent: INFO {AUTHENTICATED_LINE}" in stderr
         assert "email-agent: WARNING auth: refused GET /openapi.json from testclient (no token)" in stderr
+
+    def test_the_start_up_lines_are_written_to_stderr(self, monkeypatch, capsys):
+        with no_root_handlers():
+            with TestClient(app):
+                pass
+            monkeypatch.setenv("EMAIL_AGENT_AUTH", "off")
+            with TestClient(app):
+                pass
+
+        stderr = capsys.readouterr().err
+        assert f"email-agent: INFO {REQUIRED_STARTUP_LINE}" in stderr
+        assert "email-agent: WARNING auth: EMAIL_AGENT_AUTH=off" in stderr
 
     def test_the_stderr_handler_is_removed_at_shutdown(self):
         logger = logging.getLogger(AUTH_LOGGER)
         before = (list(logger.handlers), logger.level)
 
-        with TestClient(app):
+        with no_root_handlers(), TestClient(app):
             assert len(logger.handlers) == len(before[0]) + 1
+            assert logger.level == logging.INFO
 
+        assert (list(logger.handlers), logger.level) == before
+
+    def test_with_a_handler_on_the_root_logger_each_line_is_written_once(self, capsys):
+        logger = logging.getLogger(AUTH_LOGGER)
+        before = (list(logger.handlers), logger.level)
+
+        with no_root_handlers(), handler_on("") as root_handler, TestClient(app) as client:
+            client.get("/openapi.json", headers=BEARER)
+
+        stderr = capsys.readouterr().err
+        written = root_handler.messages + stderr.splitlines()
+        assert len([line for line in written if AUTHENTICATED_LINE in line]) == 1
+        assert len([line for line in written if REQUIRED_STARTUP_LINE in line]) == 1
         assert (list(logger.handlers), logger.level) == before
 
     def test_a_handler_the_operator_attached_is_left_alone(self):
         logger = logging.getLogger(AUTH_LOGGER)
-        own = logging.NullHandler()
-        logger.addHandler(own)
-        try:
+        with handler_on(AUTH_LOGGER) as own:
             with TestClient(app):
                 assert logger.handlers == [own]
             assert logger.handlers == [own]
-        finally:
-            logger.removeHandler(own)
+
+    def test_with_its_level_unset_the_operators_handler_gets_the_info_lines(self):
+        logger = logging.getLogger(AUTH_LOGGER)
+        assert logger.level == logging.NOTSET
+
+        with handler_on(AUTH_LOGGER) as own:
+            with TestClient(app) as client:
+                client.get("/openapi.json", headers=BEARER)
+            assert logger.level == logging.NOTSET
+
+        assert any(REQUIRED_STARTUP_LINE in message for message in own.messages)
+        assert AUTHENTICATED_LINE in own.messages
+
+    def test_a_level_the_operator_set_is_left_alone(self):
+        logger = logging.getLogger(AUTH_LOGGER)
+        with handler_on(AUTH_LOGGER) as own:
+            logger.setLevel(logging.WARNING)
+            try:
+                with TestClient(app) as client:
+                    assert logger.level == logging.WARNING
+                    client.get("/openapi.json", headers=BEARER)
+                    client.get("/openapi.json")
+                assert logger.level == logging.WARNING
+            finally:
+                logger.setLevel(logging.NOTSET)
+
+        assert AUTHENTICATED_LINE not in own.messages
+        assert "auth: refused GET /openapi.json from testclient (no token)" in own.messages
 
 
 def _free_loopback_port() -> int:
