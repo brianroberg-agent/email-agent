@@ -244,11 +244,14 @@ def match_token(presented: str, keys: Sequence[ApiKey]) -> str | None:
 
 
 def parse_api_keys(raw: str | None) -> tuple[ApiKey, ...]:
-    """Parse the EMAIL_AGENT_API_KEYS value: comma-separated name:token pairs.
+    """Parse the EMAIL_AGENT_API_KEYS value: comma-separated name:token pairs,
+    with exactly one ':' in each entry (a token may not contain one).
 
     Raises AuthConfigError for a malformed value. The error names the entry
-    by its position and repeats nothing from the value, so a token pasted in
-    the wrong place is not printed.
+    by its position and repeats nothing from the value. Names are logged by
+    design; an entry that is only a token, with no name, is read as a name
+    and a token if the token has one ':' in it, and that name is then
+    logged.
     """
     keys: list[ApiKey] = []
     entries = [entry.strip() for entry in (raw or "").split(",")]
@@ -265,6 +268,12 @@ def parse_api_keys(raw: str | None) -> tuple[ApiKey, ...]:
             )
         if not token:
             raise _entry_error(position, "has an empty token")
+        if ":" in token:
+            raise _entry_error(
+                position,
+                "has more than one ':'; each entry is name:token, and a token "
+                "may not contain ':'",
+            )
         if not _TOKEN_PATTERN.fullmatch(token):
             raise _entry_error(
                 position,

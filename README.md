@@ -103,8 +103,10 @@ The body is the same for a missing token and a wrong one; the server log says wh
 Rules for `EMAIL_AGENT_API_KEYS`:
 
 - A **name** is 1 to 31 characters from letters, digits, `.`, `_` and `-`. It identifies the caller in the log.
-- A **token** is at least 32 printable ASCII characters, with no spaces and no commas.
+- A **token** is at least 32 printable ASCII characters, with no spaces, no commas and no `:`. So each entry has exactly one `:`, between the name and the token.
 - No name and no token may appear twice.
+
+Names are written to the log on purpose: the start-up line lists them, and each authenticated request names its caller. If an entry is a token whose name was forgotten, the service cannot always tell: an entry with no `:` is refused, but a token whose text has one `:` in it is read as a name and a token, and the part before the `:` is logged as a name. A token minted with the command under [Minting a token](#minting-a-token) is URL-safe Base64 text, which has no `:` in it.
 
 In `required` and `optional` mode, a value that breaks a rule stops the service at start-up. The message gives the position of the offending entry (`entry 2 ...`) and repeats nothing from the value. In `off` mode the service does not read `EMAIL_AGENT_API_KEYS` at all, so a malformed value does not stop it.
 

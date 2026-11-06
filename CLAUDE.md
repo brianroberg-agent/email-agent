@@ -97,7 +97,7 @@ All endpoints except `GET /health` need `Authorization: Bearer <token>` in the d
 Copy `.env.example` to `.env` and configure:
 
 - `PROXY_API_KEY` - **Required**. API key for authenticating with the proxy server (format: `aproxy_<32-chars>`)
-- `EMAIL_AGENT_API_KEYS` - Tokens for callers of this service: comma-separated `name:token` pairs (name 1-31 characters of letters, digits, `.`, `_`, `-`; token at least 32 printable ASCII characters). Required in the default mode: with `EMAIL_AGENT_AUTH=required` and no tokens the service refuses to start
+- `EMAIL_AGENT_API_KEYS` - Tokens for callers of this service: comma-separated `name:token` pairs (name 1-31 characters of letters, digits, `.`, `_`, `-`; token at least 32 printable ASCII characters with no `:`, so each entry has exactly one `:`; names are logged by design). Required in the default mode: with `EMAIL_AGENT_AUTH=required` and no tokens the service refuses to start
 - `EMAIL_AGENT_AUTH` - `required` (default; 401 without a configured token), `optional` (requests without a token are served and logged as warnings; a wrong token is still 401), or `off` (no authentication; warns at start-up; `EMAIL_AGENT_API_KEYS` is not read, so a malformed list does not stop start-up)
 - `PROXY_URL` - URL of the proxy server (default: `http://host.docker.internal:8000`)
 - `PROXY_CONFIRMATION_TIMEOUT` - The proxy's approval window in seconds (its `--confirmation-timeout`; `0` = it waits forever). Must match the proxy; gated calls wait this long plus 30 s (default: `300`)

@@ -43,12 +43,27 @@ class TestParseApiKeys:
     def test_unset_or_blank_setting_gives_no_keys(self, raw):
         assert auth.parse_api_keys(raw) == ()
 
-    def test_a_token_may_contain_colons(self):
-        token = "synthetic:token:with:colons:dddddddddddd"
-        keys = auth.parse_api_keys(f"alpha:{token}")
+    @pytest.mark.parametrize(
+        "raw",
+        [
+            "alpha:synthetic:secret:with:colons:dddddddddddd",
+            f"alpha:{TOKEN_A}:",
+            f"alpha:{TOKEN_A},beta:{TOKEN_B[:10]}:{TOKEN_B[10:]}",
+        ],
+        ids=["colons inside the token", "a trailing colon", "colon in a second entry's token"],
+    )
+    def test_a_token_containing_a_colon_is_refused(self, raw):
+        """Each entry has exactly one colon. A token pasted without its name
+        whose text happens to contain a colon cannot be told apart from a
+        name:token pair, so a token may not contain one; the documented
+        minting command never produces one."""
+        with pytest.raises(auth.AuthConfigError) as excinfo:
+            auth.parse_api_keys(raw)
 
-        assert keys[0].name == "alpha"
-        assert keys[0].matches(token)
+        message = str(excinfo.value)
+        expected_entry = "entry 2" if "," in raw else "entry 1"
+        assert expected_entry in message
+        assert "':'" in message
 
 
 # Each case: (setting value, text the error must contain). The values are
@@ -69,6 +84,7 @@ MALFORMED_KEYS = {
     "name as long as a token": (f"{TOKEN_B}:{TOKEN_A}", "entry 1"),
     "name of 32 characters": (f"{'n' * 32}:{TOKEN_A}", "entry 1"),
     "second entry malformed": (f"alpha:{TOKEN_A},beta", "entry 2"),
+    "token containing a colon": ("alpha:synthetic:secret:with:colons:dddddddddddd", "entry 1"),
 }
 
 
