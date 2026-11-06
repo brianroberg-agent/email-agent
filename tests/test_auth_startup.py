@@ -361,12 +361,16 @@ def _server_env(**settings: str) -> dict[str, str]:
     }
 
 
-@contextmanager
-def running_server(**settings: str):
-    """Start the service with the documented command on a loopback port,
-    yield an httpx client for it, then stop it. The yielded dict gains the
-    process's stderr under "stderr" once the block exits."""
-    port = _free_loopback_port()
+LAUNCH_ATTEMPTS = 3
+
+
+class _PortTaken(Exception):
+    """uvicorn exited because its port was taken in the meantime."""
+
+
+def _launch(port: int, settings: dict[str, str]) -> subprocess.Popen:
+    """Start the server on `port` and wait until it answers /health. Raises
+    _PortTaken if it exits because the port is in use."""
     process = subprocess.Popen(
         _server_command(port),
         cwd=REPO_ROOT,
@@ -375,21 +379,50 @@ def running_server(**settings: str):
         stderr=subprocess.PIPE,
         text=True,
     )
-    result: dict = {}
+    # A short timeout, so a port held by a process that never answers is
+    # given up on quickly; a slow first answer is simply asked for again.
+    with httpx.Client(base_url=f"http://127.0.0.1:{port}", trust_env=False, timeout=1) as probe:
+        deadline = time.monotonic() + 30
+        while True:
+            if process.poll() is not None:
+                _, stderr = process.communicate()
+                if "address already in use" in stderr.lower():
+                    raise _PortTaken(stderr)
+                pytest.fail(f"the server exited during start-up:\n{stderr}")
+            try:
+                answered = probe.get("/health").status_code == 200
+            except httpx.TransportError:
+                answered = False
+            # The answer counts only if this process is still the one running.
+            if answered and process.poll() is None:
+                return process
+            if time.monotonic() > deadline:
+                process.kill()
+                process.communicate()
+                pytest.fail("the server did not answer /health within 30 s")
+            time.sleep(0.1)
+
+
+@contextmanager
+def running_server(**settings: str):
+    """Start the service with the documented command on a loopback port,
+    yield an httpx client for it, then stop it. The yielded dict gains the
+    process's stderr under "stderr" once the block exits.
+
+    The port is one that was free a moment before; if another process takes
+    it before uvicorn binds it, the launch is retried on a new port, up to
+    LAUNCH_ATTEMPTS times."""
+    for attempt in range(1, LAUNCH_ATTEMPTS + 1):
+        port = _free_loopback_port()
+        try:
+            process = _launch(port, settings)
+            break
+        except _PortTaken as taken:
+            if attempt == LAUNCH_ATTEMPTS:
+                pytest.fail(f"every port tried was taken:\n{taken}")
+    result: dict = {"port": port}
     try:
         with httpx.Client(base_url=f"http://127.0.0.1:{port}", trust_env=False, timeout=5) as client:
-            deadline = time.monotonic() + 30
-            while True:
-                if process.poll() is not None:
-                    pytest.fail(f"the server exited during start-up:\n{process.stderr.read()}")
-                try:
-                    if client.get("/health").status_code == 200:
-                        break
-                except httpx.TransportError:
-                    pass
-                if time.monotonic() > deadline:
-                    pytest.fail("the server did not answer /health within 30 s")
-                time.sleep(0.1)
             result["client"] = client
             yield result
     finally:
@@ -399,6 +432,37 @@ def running_server(**settings: str):
         except subprocess.TimeoutExpired:
             process.kill()
             _, result["stderr"] = process.communicate()
+
+
+class TestServerLauncher:
+    def test_a_port_taken_before_the_server_binds_it_is_retried_on_another(
+        self, monkeypatch
+    ):
+        """_free_loopback_port() hands out a port that is free when it is
+        asked; another process can take it before uvicorn binds it. Here
+        the first port handed out is already taken, and the launcher has to
+        move on to the next one."""
+        with socket.socket() as taken:
+            taken.bind(("127.0.0.1", 0))
+            taken.listen()
+            busy_port = taken.getsockname()[1]
+            real_free_port = _free_loopback_port
+            handed_out = [busy_port]
+            monkeypatch.setattr(
+                sys.modules[__name__],
+                "_free_loopback_port",
+                lambda: handed_out.pop(0) if handed_out else real_free_port(),
+            )
+
+            with running_server(
+                EMAIL_AGENT_AUTH="required",
+                EMAIL_AGENT_API_KEYS=f"{TEST_CALLER}:{TEST_API_TOKEN}",
+            ) as server:
+                response = server["client"].get("/openapi.json")
+
+        assert handed_out == []
+        assert response.status_code == 401
+        assert server["port"] != busy_port
 
 
 class TestServerProcess:
