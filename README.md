@@ -120,7 +120,7 @@ The service keeps a SHA-256 digest of each token rather than the token text, and
 | `optional` | served, and logged as a warning | 401 | served |
 | `off` | served | served | served |
 
-- **`required`**: with no tokens configured the service refuses to start. It prints `email-agent: ERROR refusing to start: ...`, naming both settings, and under `uvicorn` exits with a non-zero status before it binds its port.
+- **`required`**: with no tokens configured the service refuses to start. It prints `email-agent: ERROR refusing to start: ...`, naming both settings. Run as a single process (the start command under [Usage](#usage), which is also the Dockerfile's command), it then exits with a non-zero status before uvicorn reports `Uvicorn running on ...`. Under `uvicorn --workers N` or `--reload` it is different: the parent process binds the port and stays up, and each worker it starts prints the same message and exits, so no request is served but the process does not exit either.
 - **`optional`**: for moving an existing deployment over. A request with no `Authorization` header is served and produces one warning line with the method, path and client address, so the callers that have not been given a token yet can be found.
 - **`off`**: no authentication. The service logs a warning at start-up saying so. `EMAIL_AGENT_API_KEYS` is not read in this mode.
 
@@ -150,7 +150,7 @@ curl http://localhost:8081/labels \
 
 ### Rolling it out to a running deployment
 
-`required` is the default, so **a deployment upgraded to this version with neither setting in its environment does not start**: it exits at start-up with the message above. Set the two variables before, or together with, the upgrade. Where the service runs in a container, check that both variables are actually passed into the container's environment.
+`required` is the default, so **a deployment upgraded to this version with neither setting in its environment does not start**: it refuses to start with the message above (run as a single process it exits; under `--workers` or `--reload` the parent stays up while each worker refuses to start). Set the two variables before, or together with, the upgrade. Where the service runs in a container, check that both variables are actually passed into the container's environment.
 
 1. Mint a token for each caller. Set `EMAIL_AGENT_API_KEYS` to the pairs and `EMAIL_AGENT_AUTH=optional`, then restart. Callers without a token keep working, and each of their requests is logged.
 2. Give each caller its token. The `unauthenticated request served` lines in the log show which routes are still being called without one, and from which address.

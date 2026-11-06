@@ -102,8 +102,10 @@ def strip_think_tags(text: str) -> str:
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
     # Read the authentication settings once, here, so a bad configuration
-    # stops the service before it accepts a request. Nothing below runs, and
-    # the server never binds its port, if this raises.
+    # stops the service before it serves a request. If this raises, nothing
+    # below runs; single-process uvicorn then exits before reporting that it
+    # is running, while under --workers or --reload the parent process keeps
+    # the port and each worker exits here.
     try:
         auth_settings = load_auth_settings(os.environ)
     except AuthConfigError as e:
