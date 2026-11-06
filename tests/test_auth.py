@@ -342,9 +342,8 @@ class TestMiddleware:
 
         client = TestClient(_wrapped_app())
 
-        with pytest.raises(WebSocketDisconnect) as excinfo:
-            with client.websocket_connect("/socket"):
-                pass
+        with pytest.raises(WebSocketDisconnect) as excinfo, client.websocket_connect("/socket"):
+            pass
 
         assert excinfo.value.code == 1008
 

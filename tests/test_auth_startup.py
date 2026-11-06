@@ -65,9 +65,8 @@ class TestStartupRefusal:
         monkeypatch.setenv("EMAIL_AGENT_AUTH", mode)
         monkeypatch.setenv("EMAIL_AGENT_API_KEYS", keys)
 
-        with pytest.raises(auth.AuthConfigError):
-            with TestClient(app):
-                pytest.fail("the application started")
+        with pytest.raises(auth.AuthConfigError), TestClient(app):
+            pytest.fail("the application started")
 
         stderr = capsys.readouterr().err
         assert "email-agent: ERROR refusing to start" in stderr
@@ -76,9 +75,8 @@ class TestStartupRefusal:
     def test_required_mode_with_no_tokens_names_both_settings(self, monkeypatch, capsys):
         monkeypatch.setenv("EMAIL_AGENT_API_KEYS", "")
 
-        with pytest.raises(auth.AuthConfigError):
-            with TestClient(app):
-                pytest.fail("the application started")
+        with pytest.raises(auth.AuthConfigError), TestClient(app):
+            pytest.fail("the application started")
 
         stderr = capsys.readouterr().err
         assert "EMAIL_AGENT_API_KEYS" in stderr
@@ -172,6 +170,18 @@ class TestSettingsAreReadAtStartup:
         monkeypatch.setenv("EMAIL_AGENT_AUTH", "off")
         with TestClient(app) as client:
             assert client.get("/openapi.json").status_code == 200
+
+
+    def test_settings_loaded_at_start_up_are_dropped_at_shutdown(self, monkeypatch):
+        """After a shutdown the application holds no settings from the run
+        that ended: driven without its start-up hook, it reads the
+        environment as it is now."""
+        with TestClient(app):
+            pass
+
+        monkeypatch.setenv("EMAIL_AGENT_AUTH", "off")
+
+        assert TestClient(app).get("/openapi.json").status_code == 200
 
 
 class TestRequestLogReachesStderr:
@@ -283,6 +293,7 @@ class TestServerProcess:
             capture_output=True,
             text=True,
             timeout=30,
+            check=False,
         )
 
         assert completed.returncode != 0

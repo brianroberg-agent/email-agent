@@ -5,10 +5,9 @@ import hmac
 import json
 import logging
 import re
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Callable, Iterable, Mapping, Optional, Sequence
-
 
 logger = logging.getLogger("email_agent.auth")
 
@@ -20,7 +19,7 @@ MIN_TOKEN_LENGTH = 32
 # name position is rejected rather than accepted as a name and logged.
 MAX_NAME_LENGTH = MIN_TOKEN_LENGTH - 1
 
-_NAME_PATTERN = re.compile(r"[A-Za-z0-9._-]{1,%d}" % MAX_NAME_LENGTH)
+_NAME_PATTERN = re.compile(rf"[A-Za-z0-9._-]{{1,{MAX_NAME_LENGTH}}}")
 _TOKEN_PATTERN = re.compile(r"[\x21-\x7e]+")
 
 
@@ -85,8 +84,10 @@ def startup_messages(settings: AuthSettings) -> list[tuple[int, str]]:
         return [
             (
                 logging.WARNING,
-                f"auth: {MODE_ENV}=off: every request is served without "
-                "authentication",
+                (
+                    f"auth: {MODE_ENV}=off: every request is served without "
+                    "authentication"
+                ),
             )
         ]
     if settings.mode is AuthMode.OPTIONAL:
@@ -99,15 +100,19 @@ def startup_messages(settings: AuthSettings) -> list[tuple[int, str]]:
         return [
             (
                 logging.WARNING,
-                f"auth: {MODE_ENV}=optional: requests without a token are served "
-                f"and logged; {configured}",
+                (
+                    f"auth: {MODE_ENV}=optional: requests without a token are "
+                    f"served and logged; {configured}"
+                ),
             )
         ]
     return [
         (
             logging.INFO,
-            f"auth: {MODE_ENV}=required: every route except the health check "
-            f"needs a bearer token; tokens are configured for: {callers}",
+            (
+                f"auth: {MODE_ENV}=required: every route except the health check "
+                f"needs a bearer token; tokens are configured for: {callers}"
+            ),
         )
     ]
 
@@ -123,7 +128,7 @@ class StderrLogging:
     FORMAT = "email-agent: %(levelname)s %(message)s"
 
     def __init__(self) -> None:
-        self._handler: Optional[logging.Handler] = None
+        self._handler: logging.Handler | None = None
         self._previous_level = logging.NOTSET
 
     def install(self) -> None:
@@ -153,7 +158,7 @@ class Decision:
     """
 
     allowed: bool
-    caller: Optional[str]
+    caller: str | None
     credential: str
 
 
@@ -179,7 +184,7 @@ def decide(settings: AuthSettings, authorization: Sequence[str]) -> Decision:
     return Decision(allowed=True, caller=caller, credential="valid")
 
 
-def match_token(presented: str, keys: Sequence[ApiKey]) -> Optional[str]:
+def match_token(presented: str, keys: Sequence[ApiKey]) -> str | None:
     """Return the name of the key `presented` matches, or None.
 
     Compares SHA-256 digests with hmac.compare_digest and visits every key,
@@ -194,7 +199,7 @@ def match_token(presented: str, keys: Sequence[ApiKey]) -> Optional[str]:
     return caller
 
 
-def parse_api_keys(raw: Optional[str]) -> tuple[ApiKey, ...]:
+def parse_api_keys(raw: str | None) -> tuple[ApiKey, ...]:
     """Parse the EMAIL_AGENT_API_KEYS value: comma-separated name:token pairs.
 
     Raises AuthConfigError for a malformed value. The error names the entry
