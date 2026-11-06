@@ -58,6 +58,16 @@ def assert_unauthorized(response, method="GET"):
         assert response.json() == UNAUTHORIZED_BODY
 
 
+class TestTheExemptList:
+    def test_the_exempt_list_is_exactly_the_health_check(self):
+        """The route walk below fills path parameters with a placeholder,
+        so it cannot see an exempt entry such as `/drafts/r123`. This pins
+        the list itself: widening it means changing this test on purpose."""
+        import email_server
+
+        assert email_server.AUTH_EXEMPT_PATHS == {"/health"}
+
+
 class TestRouteWalk:
     def test_the_walk_sees_the_api_and_the_documentation_routes(self):
         paths = {path for _, path in ALL_OPERATIONS}

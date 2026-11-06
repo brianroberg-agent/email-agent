@@ -68,7 +68,7 @@ The test suite uses mocked proxy client and LLM responses - no credentials requi
 
 4. **Structured endpoints**: Each operation has a dedicated endpoint rather than a single natural-language endpoint.
 
-5. **Caller authentication in front of the app, default deny**: `BearerAuthMiddleware` (`auth.py`) wraps the whole application and checks `Authorization: Bearer <token>` before routing. The paths served without a token are listed in `AUTH_EXEMPT_PATHS` in `email_server.py` (`/health`). A new route needs nothing added to be protected; do not add per-route auth dependencies. `tests/test_auth_enforcement.py` walks `app.routes` and fails if any operation other than `GET /health` answers without a token, so widening the exempt list means changing that test on purpose.
+5. **Caller authentication in front of the app, default deny**: `BearerAuthMiddleware` (`auth.py`) wraps the whole application and checks `Authorization: Bearer <token>` before routing. The paths served without a token are listed in `AUTH_EXEMPT_PATHS` in `email_server.py` (`/health`). A new route needs nothing added to be protected; do not add per-route auth dependencies. `tests/test_auth_enforcement.py` walks `app.routes` and fails if any operation other than `GET /health` answers without a token. The walk fills path parameters with a placeholder, so it does not see an exempt entry for one concrete path such as `/drafts/r123`; `TestTheExemptList` in the same file pins `AUTH_EXEMPT_PATHS == {"/health"}` exactly, so widening the list means changing that test on purpose.
 
 ## API Endpoints
 
