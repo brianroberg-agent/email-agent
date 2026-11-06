@@ -120,6 +120,14 @@ class TestParseApiKeysRejectsMalformedSettings:
         assert "digest" not in repr(key)
 
 
+# Key lists that `required` and `optional` refuse and `off` does not read.
+BAD_KEY_LISTS = {
+    "malformed entry": "garbage-without-a-separator",
+    "too-short token": "alpha:too-short",
+    "quoted value": f'"alpha:{TOKEN_A}"',
+}
+
+
 class TestLoadAuthSettings:
     def test_mode_defaults_to_required(self):
         settings = auth.load_auth_settings({"EMAIL_AGENT_API_KEYS": f"alpha:{TOKEN_A}"})
@@ -187,14 +195,34 @@ class TestLoadAuthSettings:
         assert settings.mode is auth.AuthMode(mode)
         assert settings.keys == ()
 
-    @pytest.mark.parametrize("mode", ["required", "optional", "off"])
-    def test_a_malformed_key_list_is_refused_in_every_mode(self, mode):
+    @pytest.mark.parametrize("raw", sorted(BAD_KEY_LISTS.values()), ids=sorted(BAD_KEY_LISTS))
+    @pytest.mark.parametrize("mode", ["required", "optional"])
+    def test_a_malformed_key_list_is_refused_when_tokens_are_checked(self, mode, raw):
         with pytest.raises(auth.AuthConfigError) as excinfo:
-            auth.load_auth_settings(
-                {"EMAIL_AGENT_AUTH": mode, "EMAIL_AGENT_API_KEYS": "alpha:too-short"}
-            )
+            auth.load_auth_settings({"EMAIL_AGENT_AUTH": mode, "EMAIL_AGENT_API_KEYS": raw})
 
         assert "entry 1" in str(excinfo.value)
+
+    @pytest.mark.parametrize("raw", sorted(BAD_KEY_LISTS.values()), ids=sorted(BAD_KEY_LISTS))
+    def test_off_mode_does_not_read_the_key_list(self, raw):
+        """`off` is the documented way back when the key list is the
+        problem, so in `off` mode the list is not parsed at all."""
+        settings = auth.load_auth_settings({"EMAIL_AGENT_AUTH": "off", "EMAIL_AGENT_API_KEYS": raw})
+
+        assert settings.mode is auth.AuthMode.OFF
+        assert settings.keys == ()
+
+    def test_off_mode_does_not_parse_a_well_formed_key_list_either(self, monkeypatch):
+        def fail(raw):
+            raise AssertionError("off mode parsed the key list")
+
+        monkeypatch.setattr(auth, "parse_api_keys", fail)
+
+        settings = auth.load_auth_settings(
+            {"EMAIL_AGENT_AUTH": "off", "EMAIL_AGENT_API_KEYS": f"alpha:{TOKEN_A}"}
+        )
+
+        assert settings.keys == ()
 
     def test_settings_repr_holds_no_token(self):
         settings = auth.load_auth_settings(

@@ -57,8 +57,10 @@ class AuthSettings:
 def load_auth_settings(environ: Mapping[str, str]) -> AuthSettings:
     """Read the mode and the keys from `environ`.
 
-    Raises AuthConfigError for an unknown mode, a malformed key list (in any
-    mode), or `required` mode with no keys.
+    In `off` mode the key list is not read, so `off` starts whatever it
+    holds. Raises AuthConfigError for an unknown mode, for a malformed key
+    list in `required` or `optional` mode, or for `required` mode with no
+    keys.
     """
     raw_mode = (environ.get(MODE_ENV) or "").strip().lower()
     allowed = ", ".join(mode.value for mode in AuthMode)
@@ -66,6 +68,8 @@ def load_auth_settings(environ: Mapping[str, str]) -> AuthSettings:
         mode = AuthMode(raw_mode) if raw_mode else AuthMode.REQUIRED
     except ValueError:
         raise AuthConfigError(f"{MODE_ENV} must be one of: {allowed}") from None
+    if mode is AuthMode.OFF:
+        return AuthSettings(mode=mode, keys=())
     keys = parse_api_keys(environ.get(KEYS_ENV))
     if mode is AuthMode.REQUIRED and not keys:
         raise AuthConfigError(

@@ -6,6 +6,8 @@ See: https://til.simonwillison.net/pytest/subtests
 
 from pathlib import Path
 
+import pytest
+
 from email_server import app
 
 
@@ -171,3 +173,19 @@ def test_no_real_looking_token_is_written_in_the_docs():
             except auth.AuthConfigError:
                 continue
             assert keys == (), f"{name} contains a usable-looking key list"
+
+
+def test_env_example_copied_as_it_is_starts_in_off_mode_and_not_in_the_default():
+    """`.env.example`'s placeholder key list keeps the default mode from
+    starting, and does not stop `off` from starting."""
+    import re
+
+    import auth
+
+    env_example = (Path(__file__).parent.parent / ".env.example").read_text()
+    (keys,) = re.findall(r"^EMAIL_AGENT_API_KEYS=(.*)$", env_example, re.MULTILINE)
+
+    with pytest.raises(auth.AuthConfigError):
+        auth.load_auth_settings({"EMAIL_AGENT_API_KEYS": keys})
+    settings = auth.load_auth_settings({"EMAIL_AGENT_AUTH": "off", "EMAIL_AGENT_API_KEYS": keys})
+    assert settings.mode is auth.AuthMode.OFF

@@ -106,7 +106,7 @@ Rules for `EMAIL_AGENT_API_KEYS`:
 - A **token** is at least 32 printable ASCII characters, with no spaces and no commas.
 - No name and no token may appear twice.
 
-A value that breaks a rule stops the service at start-up. The message gives the position of the offending entry (`entry 2 ...`) and repeats nothing from the value.
+In `required` and `optional` mode, a value that breaks a rule stops the service at start-up. The message gives the position of the offending entry (`entry 2 ...`) and repeats nothing from the value. In `off` mode the service does not read `EMAIL_AGENT_API_KEYS` at all, so a malformed value does not stop it.
 
 Give each caller its own name and token. To replace one caller's token, change that caller's pair and restart the service; the other pairs are unaffected.
 
@@ -122,7 +122,7 @@ The service keeps a SHA-256 digest of each token rather than the token text, and
 
 - **`required`**: with no tokens configured the service refuses to start. It prints `email-agent: ERROR refusing to start: ...`, naming both settings, and under `uvicorn` exits with a non-zero status before it binds its port.
 - **`optional`**: for moving an existing deployment over. A request with no `Authorization` header is served and produces one warning line with the method, path and client address, so the callers that have not been given a token yet can be found.
-- **`off`**: no authentication. The service logs a warning at start-up saying so.
+- **`off`**: no authentication. The service logs a warning at start-up saying so. `EMAIL_AGENT_API_KEYS` is not read in this mode.
 
 "Wrong token" means any `Authorization` header that is not exactly one `Bearer <configured token>`: an unknown token, another scheme such as `Basic`, an empty header, or two `Authorization` headers.
 
@@ -156,7 +156,7 @@ curl http://localhost:8081/labels \
 2. Give each caller its token. The `unauthenticated request served` lines in the log show which routes are still being called without one, and from which address.
 3. When those lines have stopped, set `EMAIL_AGENT_AUTH=required` (or remove the setting) and restart.
 
-To back out, set `EMAIL_AGENT_AUTH=off` and restart.
+To back out, set `EMAIL_AGENT_AUTH=off` and restart. Because `off` does not read `EMAIL_AGENT_API_KEYS`, this also brings the service up when the key list is what stops it.
 
 ### Log lines
 

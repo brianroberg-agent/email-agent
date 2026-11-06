@@ -83,6 +83,39 @@ class TestStartupRefusal:
         assert "EMAIL_AGENT_AUTH" in stderr
 
 
+class TestOffModeIsTheWayBack:
+    @pytest.mark.parametrize(
+        "keys",
+        ["garbage-without-a-separator", "tests:too-short", f'"tests:{TEST_API_TOKEN}"'],
+        ids=["malformed entry", "too-short token", "quoted value"],
+    )
+    def test_off_mode_starts_and_serves_whatever_the_key_list_holds(
+        self, keys, monkeypatch, capsys
+    ):
+        monkeypatch.setenv("EMAIL_AGENT_AUTH", "off")
+        monkeypatch.setenv("EMAIL_AGENT_API_KEYS", keys)
+
+        with TestClient(app) as client:
+            assert client.get("/openapi.json").status_code == 200
+
+        assert "refusing to start" not in capsys.readouterr().err
+
+    @pytest.mark.parametrize("mode", ["required", "optional"])
+    @pytest.mark.parametrize(
+        "keys",
+        ["garbage-without-a-separator", "tests:too-short", f'"tests:{TEST_API_TOKEN}"'],
+        ids=["malformed entry", "too-short token", "quoted value"],
+    )
+    def test_the_other_modes_still_refuse_to_start(self, keys, mode, monkeypatch, capsys):
+        monkeypatch.setenv("EMAIL_AGENT_AUTH", mode)
+        monkeypatch.setenv("EMAIL_AGENT_API_KEYS", keys)
+
+        with pytest.raises(auth.AuthConfigError), TestClient(app):
+            pytest.fail("the application started")
+
+        assert "email-agent: ERROR refusing to start" in capsys.readouterr().err
+
+
 class TestStartupMessages:
     def test_off_mode_warns_that_nothing_is_authenticated(self, monkeypatch, auth_log, capsys):
         monkeypatch.setenv("EMAIL_AGENT_AUTH", "off")
