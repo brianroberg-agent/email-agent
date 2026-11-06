@@ -340,8 +340,11 @@ class TestServerProcess:
         ) as server:
             client = server["client"]
             tokenless = client.get("/openapi.json")
+            tokenless_head = client.head("/docs")
             authenticated = client.get("/openapi.json", headers=BEARER)
 
         assert tokenless.status_code == 401
+        assert tokenless_head.status_code == 401
+        assert tokenless_head.headers["www-authenticate"] == "Bearer"
         assert authenticated.status_code == 200
         assert "refused GET /openapi.json from 127.0.0.1 (no token)" in server["stderr"]

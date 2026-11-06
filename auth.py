@@ -188,8 +188,7 @@ def match_token(presented: str, keys: Sequence[ApiKey]) -> str | None:
     """Return the name of the key `presented` matches, or None.
 
     Compares SHA-256 digests with hmac.compare_digest and visits every key,
-    so the time taken does not depend on which key matched or on how much of
-    a token was right.
+    whichever one matches.
     """
     presented_digest = _digest(presented)
     caller = None
