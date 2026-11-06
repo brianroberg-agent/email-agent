@@ -268,6 +268,12 @@ WRONG_CREDENTIALS = {
     "a third word after the token": [f"Bearer {TOKEN_A} extra"],
     "a caller name instead of a token": ["Bearer alpha"],
     "two headers, both valid": [f"Bearer {TOKEN_A}", f"Bearer {TOKEN_B}"],
+    "a no-break space after the scheme": [f"Bearer\xa0{TOKEN_A}"],
+    "a tab after the scheme": [f"Bearer\t{TOKEN_A}"],
+    "a form feed before the scheme": [f"\x0cBearer {TOKEN_A}"],
+    "a space before the scheme": [f" Bearer {TOKEN_A}"],
+    "a space after the token": [f"Bearer {TOKEN_A} "],
+    "a tab after the token": [f"Bearer {TOKEN_A}\t"],
 }
 
 
@@ -281,8 +287,11 @@ class TestDecide:
         assert decision.caller == name
         assert decision.credential == "valid"
 
-    @pytest.mark.parametrize("header", [f"bearer {TOKEN_A}", f"BEARER {TOKEN_A}", f"Bearer   {TOKEN_A}  "])
-    def test_scheme_case_and_extra_spaces_do_not_matter(self, header):
+    @pytest.mark.parametrize(
+        "header",
+        [f"bearer {TOKEN_A}", f"BEARER {TOKEN_A}", f"Bearer   {TOKEN_A}", f"bearer  {TOKEN_A}"],
+    )
+    def test_scheme_case_and_extra_spaces_between_scheme_and_token_do_not_matter(self, header):
         decision = auth.decide(_settings("required"), [header])
 
         assert decision.allowed is True

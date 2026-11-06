@@ -126,7 +126,7 @@ The service keeps a SHA-256 digest of each token rather than the token text, and
 - **`optional`**: for moving an existing deployment over. A request with no `Authorization` header is served and produces one warning line with the method, path and client address, so the callers that have not been given a token yet can be found.
 - **`off`**: no authentication. The service logs a warning at start-up saying so. `EMAIL_AGENT_API_KEYS` is not read in this mode.
 
-"Wrong token" means any `Authorization` header that is not exactly one `Bearer <configured token>`: an unknown token, another scheme such as `Basic`, an empty header, or two `Authorization` headers.
+"Wrong token" means any `Authorization` header that is not exactly one `Bearer <configured token>`: an unknown token, another scheme such as `Basic`, an empty header, or two `Authorization` headers. The scheme may be written in any case and followed by one or more spaces before the token. Other whitespace (a tab, a no-break space) or any other text before the scheme or after the token makes it a wrong token. The HTTP server in front of the application may strip spaces and tabs at the very start and end of a header value before the check sees it.
 
 `GET /health` answers without a token in all three modes.
 

@@ -23,6 +23,9 @@ MAX_NAME_LENGTH = MIN_TOKEN_LENGTH - 1
 
 _NAME_PATTERN = re.compile(rf"[A-Za-z0-9._-]{{1,{MAX_NAME_LENGTH}}}")
 _TOKEN_PATTERN = re.compile(r"[\x21-\x7e]+")
+# The whole Authorization value: the scheme in any case, one or more ASCII
+# spaces, then the token. Nothing before or after, and no other whitespace.
+_BEARER_PATTERN = re.compile(r"[Bb][Ee][Aa][Rr][Ee][Rr] +([\x21-\x7e]+)")
 
 
 class AuthConfigError(ValueError):
@@ -211,7 +214,9 @@ def decide(settings: AuthSettings, authorization: Sequence[str]) -> Decision:
     """Decide a request from its Authorization header values.
 
     Only the absence of the header counts as "no token". A header that is
-    present but is not exactly one `Bearer <configured token>` is invalid.
+    present but is not exactly one `Bearer <configured token>` is invalid:
+    the scheme in any case, then one or more ASCII spaces (no other
+    whitespace), then the token, with nothing before or after.
     """
     if settings.mode is AuthMode.OFF:
         return Decision(allowed=True, caller=None, credential="unchecked")
@@ -221,9 +226,9 @@ def decide(settings: AuthSettings, authorization: Sequence[str]) -> Decision:
         )
     caller = None
     if len(authorization) == 1:
-        parts = authorization[0].split()
-        if len(parts) == 2 and parts[0].lower() == "bearer":
-            caller = match_token(parts[1], settings.keys)
+        match = _BEARER_PATTERN.fullmatch(authorization[0])
+        if match:
+            caller = match_token(match.group(1), settings.keys)
     if caller is None:
         return Decision(allowed=False, caller=None, credential="invalid")
     return Decision(allowed=True, caller=caller, credential="valid")
